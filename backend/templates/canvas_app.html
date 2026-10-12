@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>槐花MV · 灵感有花期，创作不设限</title>
+    <meta name="description" content="槐花MV，你的节点式影像创作空间。灵感捕手、镜头玩家、审美先行、作品说话。">
+    <meta name="theme-color" content="#181d19">
+    <link rel="icon" type="image/svg+xml" href="/static/brand/huaihua-mark.svg">
+    <link rel="stylesheet" href="/static/canvas/canvas-app.css?v={{ asset_version }}">
+    <style>
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #141416; }
+    </style>
+</head>
+<body>
+    <div id="canvas-root"></div>
+    <script>
+        window.__CANVAS_BOOTSTRAP__ = {
+            user_id: {{ user_id | tojson }},
+            username: {{ username | tojson }},
+            credits: {{ user_credits | tojson }},
+            project_id: {{ project_id | tojson }}
+        };
+    </script>
+    <script type="module" src="/static/canvas/canvas-app.js?v={{ asset_version }}"></script>
+</body>
+</html>

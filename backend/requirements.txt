@@ -1,0 +1,4 @@
+Flask>=3.0,<4
+python-dotenv>=1.0,<2
+requests>=2.32,<3
+Pillow>=11.3,<13

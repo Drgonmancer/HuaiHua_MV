@@ -1,0 +1,2 @@
+# Compatibility entry; backend dependencies are maintained in backend/.
+-r backend/requirements.txt
