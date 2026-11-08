@@ -5,12 +5,16 @@ export type TtsModel = { id: string; label: string; credits_per_100_chars: numbe
 
 export type AudioMeta = {
   configured: boolean
+  protocol: 'openai' | 'clone' | string
+  cloning: boolean
   models: TtsModel[]
   voices: Voice[]
 }
 
 const FALLBACK: AudioMeta = {
   configured: false,
+  protocol: 'openai',
+  cloning: false,
   models: [],
   voices: [],
 }
@@ -23,12 +27,16 @@ export function getAudioMeta(): Promise<AudioMeta> {
   if (!inflight) {
     inflight = api<{
       configured?: boolean
+      protocol?: AudioMeta['protocol']
+      cloning?: boolean
       models?: TtsModel[]
       voices?: Voice[]
     }>('/api/canvas/audio-meta')
       .then((result) => {
         cache = {
           configured: Boolean(result.configured),
+          protocol: result.protocol ?? 'openai',
+          cloning: Boolean(result.cloning),
           models: result.models?.length ? result.models : FALLBACK.models,
           voices: result.voices?.length ? result.voices : FALLBACK.voices,
         }

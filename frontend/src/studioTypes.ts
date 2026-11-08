@@ -3,6 +3,8 @@ import type { CanvasEdge, CanvasNode, CanvasProject, NodeOutput } from './types'
 export type ProductionKind = 'product' | 'comic'
 export type ProductionCharacter = {
   id: string; name: string; description: string; reference_asset_ids: string[]; voice_id: string
+  voice_reference_asset_id?: string; voice_reference_text?: string
+  appearance?: string; outfit?: string; identity_locked?: boolean
 }
 export type ProductionScene = {
   id: string; name: string; description: string; reference_asset_ids: string[]
@@ -41,7 +43,10 @@ export type StudioJob = {
 }
 export type StudioSettings = {
   providers: Record<'text' | 'image' | 'video' | 'audio', { configured: boolean; model: string }>
-  ffmpeg: { available: boolean }; config_path: string
+  ffmpeg: { available: boolean }
+  subtitles?: { available: boolean; model: string }
+  audio?: { protocol?: string; cloning?: boolean }
+  config_path: string
 }
 export type StoryboardResult = {
   production: Production; nodes: CanvasNode[]; edges: CanvasEdge[]; title: string
@@ -50,4 +55,5 @@ export type ExportClip = { url: string; trim_start: number; trim_end: number; su
 export type ExportRequest = {
   project_id: string; clips: ExportClip[]; audio_urls: string[]
   aspect_ratio: string; resolution: string; fps: number
+  auto_subtitles?: boolean; subtitle_language?: string
 }

@@ -42,10 +42,11 @@ PORT_RULES = {
     'prompt': ('text', {'in:context': (('text',), 3)}),
     'asset': ('dynamic', {}),
     'image-gen': ('image', {'in:prompt': (('text',), 4), 'in:ref': (('image',), 6)}),
+    'image-edit': ('image', {'in:image': (('image',), 1), 'in:prompt': (('text',), 1), 'in:ref': (('image',), 3)}),
     'image-view': ('image', {'in:media': (('image',), 1)}),
     'video-gen': ('video', {'in:prompt': (('text',), 2), 'in:first': (('image',), 1), 'in:last': (('image',), 1)}),
     'video-view': ('video', {'in:media': (('video',), 1)}),
-    'audio-gen': ('audio', {'in:text': (('text',), 1)}),
+    'audio-gen': ('audio', {'in:text': (('text',), 1), 'in:ref': (('audio',), 1)}),
     'audio-view': ('audio', {'in:media': (('audio',), 1)}),
     'compose': ('video', {'in:video': (('video',), 1), 'in:audio': (('audio',), 2)}),
     'group': ('dynamic', {}),
@@ -135,6 +136,14 @@ def normalize_production(value, *, base=None):
                     entry.update(name=_text(item.get('name', ''), label + '.name', maximum=200), description=_text(item.get('description', ''), label + '.description'), reference_asset_ids=_strings(item.get('reference_asset_ids', []), label + '.reference_asset_ids', maximum=6))
                     if field == 'characters':
                         entry['voice_id'] = _text(item.get('voice_id', ''), label + '.voice_id', maximum=200)
+                        entry['voice_reference_asset_id'] = _id(item.get('voice_reference_asset_id', ''), label + '.voice_reference_asset_id', allow_empty=True)
+                        entry['voice_reference_text'] = _text(item.get('voice_reference_text', ''), label + '.voice_reference_text', maximum=2000)
+                        entry['appearance'] = _text(item.get('appearance', ''), label + '.appearance', maximum=500)
+                        entry['outfit'] = _text(item.get('outfit', ''), label + '.outfit', maximum=500)
+                        identity_locked = item.get('identity_locked', False)
+                        if not isinstance(identity_locked, bool):
+                            raise StudioValidationError(f'{label}.identity_locked 必须是布尔值')
+                        entry['identity_locked'] = identity_locked
                 elif field == 'episodes':
                     entry.update(title=_text(item.get('title', ''), label + '.title', maximum=200), synopsis=_text(item.get('synopsis', ''), label + '.synopsis'), script=_text(item.get('script', ''), label + '.script', maximum=100000))
                 elif field == 'shots':
@@ -260,6 +269,12 @@ class StudioService:
                 asset = self.get_asset(asset_id)
                 if asset['media_type'] != 'image':
                     raise StudioValidationError(f'素材 {asset_id} 必须是图片才能作为角色、商品或场景参考')
+        for role in production['characters']:
+            voice_reference = role.get('voice_reference_asset_id', '')
+            if voice_reference:
+                asset = self.get_asset(voice_reference)
+                if asset['media_type'] != 'audio':
+                    raise StudioValidationError(f'素材 {voice_reference} 必须是音频才能作为角色参考声音')
 
     @staticmethod
     def _png_valid(data):
@@ -365,6 +380,11 @@ class StudioService:
             if media_type in ('video', 'audio'):
                 probe = shutil.which('ffprobe')
                 if not probe:
+                    local_bin = Path(__file__).resolve().parents[2] / '.local' / 'ffmpeg' / 'bin'
+                    candidate = local_bin / 'ffprobe.exe'
+                    if candidate.is_file():
+                        probe = str(candidate)
+                if not probe:
                     raise StudioValidationError('音频与视频素材验证需要本地 FFprobe，请先安装 FFmpeg')
                 try:
                     result = subprocess.run([probe, '-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'json', str(path)], capture_output=True, timeout=20, check=False)
@@ -463,6 +483,22 @@ class StudioService:
     def _stable_id(*parts):
         return 'studio-' + uuid.uuid5(uuid.NAMESPACE_URL, '|'.join(parts)).hex
 
+    @staticmethod
+    def _identity_block(roles):
+        """Locked characters inject a hard consistency clause into every shot prompt."""
+        locked = [role for role in roles if role.get('identity_locked')]
+        if not locked:
+            return ''
+        lines = ['【形象锁定 · 跨镜头一致性】']
+        for role in locked:
+            parts = [role['name'] + '：']
+            if role.get('appearance'):
+                parts.append('外貌 ' + role['appearance'])
+            if role.get('outfit'):
+                parts.append('服装 ' + role['outfit'])
+            lines.append(''.join(parts) + '。所有镜头中外观、发型、服装保持完全一致。')
+        return '\n'.join(lines)
+
     def template_production(self, production):
         data = copy.deepcopy(production)
         kind = data['kind']
@@ -491,6 +527,9 @@ class StudioService:
         self.validate_references(data)
         characters = {role['id']: role for role in data['characters']}
         scenes = {role['id']: role for role in data['scenes']}
+        for role_id, role in characters.items():
+            if role.get('identity_locked') and not role['reference_asset_ids']:
+                raise StudioValidationError(f"角色「{role['name'] or role_id}」已锁定形象，请先在角色档案中设置至少 1 张参考图片，再搭建分镜")
         if episode_id is not None and episode_id not in {ep['id'] for ep in data['episodes']}:
             raise StudioValidationError('分集不存在')
         shots = sorted([shot for shot in data['shots'] if episode_id is None or shot['episode_id'] == episode_id], key=lambda shot: (shot['order'], shot['id']))
@@ -499,12 +538,12 @@ class StudioService:
         timeline = {entry['shot_id']: entry for entry in data['timeline']}
         data['timeline'] = [timeline.get(shot['id'], {'shot_id': shot['id'], 'order': shot['order'], 'trim_start': 0, 'trim_end': shot['duration_seconds'], 'subtitle': shot['dialogue']}) for shot in sorted(data['shots'], key=lambda shot: (shot['order'], shot['id']))]
         nodes, edges, by_id = [], [], {}
-        def node(node_id, kind, title, x, y, *, text=None, url=None, params=None, meta=None):
+        def node(node_id, kind, title, x, y, *, text=None, url=None, params=None, meta=None, media_type='image'):
             entry = {'id': node_id, 'type': kind, 'position': {'x': x, 'y': y}, 'data': {'title': title, 'params': params or {}, 'runtime': {'status': 'idle'}, **(meta or {})}}
             if text is not None:
                 entry['data']['value'] = {'text': text}
             if url:
-                entry['data'].update(mediaType='image', value={'url': url})
+                entry['data'].update(mediaType=media_type, value={'url': url})
             nodes.append(entry)
             by_id[node_id] = entry
             return node_id
@@ -517,6 +556,7 @@ class StudioService:
         context_id = self._stable_id(data['kind'], 'context')
         node(context_id, 'prompt', '作品设定 · ' + ('商品宣传片' if data['kind'] == 'product' else '分集漫剧'), 0, 0, text=f"{data['brief']}\n风格：{data['style']}\n剧本：{data['script']}")
         reference_nodes = {}
+        voice_nodes = {}
         for index, shot in enumerate(shots):
             y = 250 + index * 650
             ids = dict(shot.get('node_ids', {}))
@@ -526,9 +566,13 @@ class StudioService:
             if shot['scene_id']:
                 roles.append(scenes[shot['scene_id']])
             descriptions = '\n'.join(f"{role['name']}：{role['description']}" for role in roles)
+            identity_block = self._identity_block(roles)
             shot_meta = {'shot_id': shot['id'], 'episode_id': shot['episode_id']}
             image_text = shot['image_prompt'] or shot['description'] or shot['title']
-            node(ids['prompt'], 'prompt', shot['title'] + ' · 画面提示词', 260, y, text=f"{image_text}\n{descriptions}\n风格：{data['style']}", meta=shot_meta)
+            prompt_text = f"{image_text}\n{descriptions}\n风格：{data['style']}"
+            if identity_block:
+                prompt_text += f"\n{identity_block}"
+            node(ids['prompt'], 'prompt', shot['title'] + ' · 画面提示词', 260, y, text=prompt_text, meta=shot_meta)
             edge(context_id, ids['prompt'], 'in:context')
             node(ids['image'], 'image-gen', shot['title'] + ' · 图片', 580, y, params={'ratio': data['aspect_ratio'], 'count': 1}, meta=shot_meta)
             edge(ids['prompt'], ids['image'], 'in:prompt')
@@ -569,6 +613,19 @@ class StudioService:
                     params['voiceId'] = voice_id
                 if voice.get('model'):
                     params['model'] = voice['model']
+                # 声音克隆：角色参考音频作为素材节点连到配音节点，供本地克隆服务复用音色。
+                voice_owner = next((characters[role_id] for role_id in shot['character_ids'] if characters[role_id].get('voice_reference_asset_id')), None)
+                if voice_owner:
+                    voice_asset_id = voice_owner['voice_reference_asset_id']
+                    voice_key = ('voice', voice_owner['id'], voice_asset_id)
+                    if voice_key not in voice_nodes:
+                        asset = self.get_asset(voice_asset_id)
+                        voice_node_id = self._stable_id('voice-reference', voice_owner['id'], voice_asset_id)
+                        node(voice_node_id, 'asset', voice_owner['name'] + ' · 参考音频', 0, 200 + (len(reference_nodes) + len(voice_nodes)) * 210, url=asset['url'], media_type='audio', meta={'asset_id': voice_asset_id, 'reference_owner_id': voice_owner['id']})
+                        voice_nodes[voice_key] = voice_node_id
+                    edge(voice_nodes[voice_key], ids['audio'], 'in:ref')
+                    if voice_owner.get('voice_reference_text'):
+                        params['voiceReferenceText'] = voice_owner['voice_reference_text']
                 node(ids['audio'], 'audio-gen', shot['title'] + ' · 配音', 580, y + 300, params=params, meta=shot_meta)
                 edge(speech_id, ids['audio'], 'in:text')
                 node(ids['audio_view'], 'audio-view', shot['title'] + ' · 配音预览', 1590, y + 300, meta=shot_meta)

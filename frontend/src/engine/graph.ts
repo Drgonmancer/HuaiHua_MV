@@ -1,7 +1,7 @@
 import type { CanvasEdge } from '../types'
 
 /** 生成类节点（会产生异步任务、参与 runToNode 执行链） */
-export const GEN_NODE_TYPES = new Set(['image-gen', 'video-gen', 'audio-gen', 'compose'])
+export const GEN_NODE_TYPES = new Set(['image-gen', 'image-edit', 'video-gen', 'audio-gen', 'compose'])
 
 /** 返回 nodeId 的全部祖先 + 自身，按拓扑序（上游在前）。 */
 export function topoAncestors(nodeId: string, edges: CanvasEdge[]): string[] {

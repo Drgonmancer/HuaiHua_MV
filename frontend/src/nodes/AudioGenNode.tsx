@@ -3,7 +3,7 @@ import type { NodeProps } from '@xyflow/react'
 import type { CanvasNode } from '../types'
 import { NodeShell } from './NodeShell'
 import { useFlowStore } from '../store/flowStore'
-import { runToNode, collectInputs } from '../engine/executor'
+import { runToNode, runNode, collectInputs } from '../engine/executor'
 import { getAudioMeta, type AudioMeta } from '../api/voices'
 
 const selectStyle: React.CSSProperties = {
@@ -59,6 +59,7 @@ function AudioGenNodeInner({ id, data, selected }: NodeProps<CanvasNode>) {
   useEffect(() => {
     if (modelId && modelId !== params.model) updateNodeParams(id, { model: modelId })
   }, [id, modelId, params.model, updateNodeParams])
+  const cloning = Boolean(meta?.cloning)
 
   return (
     <NodeShell type="audio-gen" selected={selected} title={data.title}>
@@ -82,21 +83,48 @@ function AudioGenNodeInner({ id, data, selected }: NodeProps<CanvasNode>) {
             )}
           </select>,
         )}
-        {fieldRow(
-          '音色',
-          <select
-            className="nodrag"
-            style={selectStyle}
-            value={params.voiceId ?? ''}
-            onChange={(e) => updateNodeParams(id, { voiceId: e.target.value })}
-          >
-            <option value="">{meta ? '请选择音色' : '加载音色中…'}</option>
-            {(meta?.voices ?? []).map((voice) => (
-              <option key={voice.id} value={voice.id}>
-                {voice.label}
-              </option>
-            ))}
-          </select>,
+        {cloning ? (
+          <>
+            <div style={{ marginBottom: 6, fontSize: 11, color: 'var(--canvas-text-dim)' }}>
+              声音克隆：把角色参考音频连到「参考音频」端口
+            </div>
+            <textarea
+              className="nodrag"
+              value={params.voiceReferenceText ?? ''}
+              placeholder="参考音频的内容转写（可选，提升克隆稳定性）"
+              rows={2}
+              onChange={(e) => updateNodeParams(id, { voiceReferenceText: e.target.value })}
+              style={{
+                width: '100%',
+                background: 'var(--canvas-panel-2)',
+                color: 'var(--canvas-text)',
+                border: '1px solid var(--canvas-border)',
+                borderRadius: 6,
+                padding: '4px 6px',
+                fontSize: 12,
+                outline: 'none',
+                resize: 'vertical',
+                marginBottom: 6,
+              }}
+            />
+          </>
+        ) : (
+          fieldRow(
+            '音色',
+            <select
+              className="nodrag"
+              style={selectStyle}
+              value={params.voiceId ?? ''}
+              onChange={(e) => updateNodeParams(id, { voiceId: e.target.value })}
+            >
+              <option value="">{meta ? '请选择音色' : '加载音色中…'}</option>
+              {(meta?.voices ?? []).map((voice) => (
+                <option key={voice.id} value={voice.id}>
+                  {voice.label}
+                </option>
+              ))}
+            </select>,
+          )
         )}
         {fieldRow(
           '语速',
@@ -140,6 +168,24 @@ function AudioGenNodeInner({ id, data, selected }: NodeProps<CanvasNode>) {
             {charCount > 0 ? `${charCount} 字 · 按供应商计费` : '连接台词文本'}
           </span>
         </button>
+        {status === 'succeeded' && (
+          <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+            <span style={{ fontSize: 11, color: 'var(--canvas-text-dim)' }}>
+              {data.runtime.cached ? '已缓存 · 未重新计费' : '已完成'}
+            </span>
+            <button
+              className="nodrag"
+              data-node-id={id}
+              onClick={() => runNode(id, { force: true })}
+              style={{
+                fontSize: 11, color: 'var(--canvas-text)', background: 'var(--canvas-panel-2)',
+                border: '1px solid var(--canvas-border)', borderRadius: 6, padding: '3px 8px', cursor: 'pointer',
+              }}
+            >
+              重新生成（忽略缓存）
+            </button>
+          </div>
+        )}
         {status === 'failed' && (
           <div style={{ marginTop: 6, fontSize: 11, color: 'var(--canvas-danger)' }}>
             {data.runtime.error ?? '生成失败'}

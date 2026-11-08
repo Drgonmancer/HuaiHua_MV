@@ -12,7 +12,7 @@ before(async () => {
   const root = fileURLToPath(new URL('../', import.meta.url))
   const built = await build({
     stdin: {
-      contents: 'export * from "./src/engine/executor.ts"; export {useFlowStore,createNode} from "./src/store/flowStore.ts";',
+      contents: 'export * from "./src/engine/executor.ts"; export * from "./src/engine/fingerprint.ts"; export {useFlowStore,createNode} from "./src/store/flowStore.ts";',
       resolveDir: root,
       loader: 'ts',
     },
@@ -133,4 +133,73 @@ test('editing while submission is awaiting a response cannot attach the obsolete
     assert.equal(runtime.status,'stale')
     assert.ok(!runtime.jobIds?.includes('obsolete-job'))
   } finally { globalThis.fetch=originalFetch }
+})
+
+function setupCacheNode(promptText) {
+  const prompt = engine.createNode('prompt', {x: 0, y: 0}, {value: {text: promptText}})
+  const image = engine.createNode('image-gen', {x: 300, y: 0})
+  flow.getState().setGraph([prompt, image], [{id: 'cache-edge', source: prompt.id, target: image.id, targetHandle: 'in:prompt'}])
+  return {prompt, image}
+}
+
+test('unchanged inputs restore the cached result without a provider request', async () => {
+  const {image} = setupCacheNode('缓存提示词')
+  const fingerprint = engine.nodeFingerprint('image-gen', image.data.params, {prompt: ['缓存提示词']})
+  image.data.lastRun = {fingerprint, outputs: [{kind: 'image', url: '/studio-media/cached.png'}], at: new Date().toISOString()}
+  image.data.runtime = {status: 'stale'}
+  const originalFetch = globalThis.fetch
+  let posts = 0
+  globalThis.fetch = async (_url, request) => {
+    if (request.method === 'POST') posts += 1
+    return new Response(JSON.stringify({success: true, jobs: []}), {status: 200, headers: {'Content-Type': 'application/json'}})
+  }
+  try {
+    assert.equal(await engine.executeNode(image.id), true)
+    assert.equal(posts, 0, '缓存命中不应提交新任务')
+    const node = flow.getState().nodes.find(item => item.id === image.id)
+    assert.equal(node.data.runtime.status, 'succeeded')
+    assert.equal(node.data.runtime.cached, true)
+    assert.equal(node.data.outputs[0].url, '/studio-media/cached.png')
+  } finally { globalThis.fetch = originalFetch }
+})
+
+test('force re-run bypasses the cache and submits a new job', async () => {
+  const {image} = setupCacheNode('强制重跑')
+  const fingerprint = engine.nodeFingerprint('image-gen', image.data.params, {prompt: ['强制重跑']})
+  image.data.lastRun = {fingerprint, outputs: [{kind: 'image', url: '/studio-media/cached.png'}], at: new Date().toISOString()}
+  image.data.runtime = {status: 'succeeded'}
+  const originalFetch = globalThis.fetch
+  let posts = 0
+  globalThis.fetch = async (_url, request) => {
+    if (request.method === 'POST') {
+      posts += 1
+      return new Response(JSON.stringify({success: true, jobs: [{kind: 'image', id: 'forced-job'}], credits_cost: 0}), {status: 200, headers: {'Content-Type': 'application/json'}})
+    }
+    return new Response(JSON.stringify({success: true, job: {status: 'succeeded', outputs: [{kind: 'image', url: '/studio-media/forced.png'}], error: ''}}), {status: 200, headers: {'Content-Type': 'application/json'}})
+  }
+  try {
+    assert.equal(await engine.executeNode(image.id, {force: true}), true)
+    assert.equal(posts, 1, '强制重跑必须提交新的生成任务')
+  } finally { globalThis.fetch = originalFetch }
+})
+
+test('changed prompt inputs submit a new provider request', async () => {
+  const {prompt, image} = setupCacheNode('第一版提示词')
+  const fingerprint = engine.nodeFingerprint('image-gen', image.data.params, {prompt: ['第一版提示词']})
+  image.data.lastRun = {fingerprint, outputs: [{kind: 'image', url: '/studio-media/first.png'}], at: new Date().toISOString()}
+  image.data.runtime = {status: 'stale'}
+  const originalFetch = globalThis.fetch
+  let posts = 0
+  globalThis.fetch = async (_url, request) => {
+    if (request.method === 'POST') {
+      posts += 1
+      return new Response(JSON.stringify({success: true, jobs: [{kind: 'image', id: 'changed-job'}], credits_cost: 0}), {status: 200, headers: {'Content-Type': 'application/json'}})
+    }
+    return new Response(JSON.stringify({success: true, job: {status: 'succeeded', outputs: [{kind: 'image', url: '/studio-media/second.png'}], error: ''}}), {status: 200, headers: {'Content-Type': 'application/json'}})
+  }
+  try {
+    flow.getState().updateNodeValue(prompt.id, {text: '第二版提示词'})
+    assert.equal(await engine.executeNode(image.id), true)
+    assert.equal(posts, 1, '提示词变化后应发起新请求')
+  } finally { globalThis.fetch = originalFetch }
 })

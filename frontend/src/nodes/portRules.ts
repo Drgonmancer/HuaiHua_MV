@@ -22,6 +22,14 @@ export const PORT_RULES: Record<NodeKind, NodeRule> = {
       'in:ref': { accepts: ['image'], max: 6 },
     },
   },
+  'image-edit': {
+    produces: 'image',
+    inputs: {
+      'in:image': { accepts: ['image'], max: 1 },
+      'in:prompt': { accepts: ['text'], max: 1 },
+      'in:ref': { accepts: ['image'], max: 3 },
+    },
+  },
   'image-view': {
     produces: 'image',
     inputs: { 'in:media': { accepts: ['image'], max: 1 } },
@@ -40,7 +48,10 @@ export const PORT_RULES: Record<NodeKind, NodeRule> = {
   },
   'audio-gen': {
     produces: 'audio',
-    inputs: { 'in:text': { accepts: ['text'], max: 1 } },
+    inputs: {
+      'in:text': { accepts: ['text'], max: 1 },
+      'in:ref': { accepts: ['audio'], max: 1 },
+    },
   },
   'audio-view': {
     produces: 'audio',

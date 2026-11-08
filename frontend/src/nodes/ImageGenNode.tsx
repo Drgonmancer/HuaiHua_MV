@@ -3,7 +3,7 @@ import type { NodeProps } from '@xyflow/react'
 import type { CanvasNode } from '../types'
 import { NodeShell } from './NodeShell'
 import { useFlowStore } from '../store/flowStore'
-import { runToNode } from '../engine/executor'
+import { runToNode, runNode } from '../engine/executor'
 import { getImageModels, type ImageModel } from '../api/imageModels'
 
 const RATIOS = ['1:1', '4:3', '3:4', '16:9', '9:16']
@@ -124,6 +124,24 @@ function ImageGenNodeInner({ id, data, selected }: NodeProps<CanvasNode>) {
           {busy ? '生成中…' : stale ? '重新生成（上游已变更）' : '开始生成'}
           <span style={{ fontSize: 11, opacity: 0.85 }}>按供应商计费</span>
         </button>
+        {status === 'succeeded' && (
+          <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
+            <span style={{ fontSize: 11, color: 'var(--canvas-text-dim)' }}>
+              {data.runtime.cached ? '已缓存 · 未重新计费' : '已完成'}
+            </span>
+            <button
+              className="nodrag"
+              data-node-id={id}
+              onClick={() => runNode(id, { force: true })}
+              style={{
+                fontSize: 11, color: 'var(--canvas-text)', background: 'var(--canvas-panel-2)',
+                border: '1px solid var(--canvas-border)', borderRadius: 6, padding: '3px 8px', cursor: 'pointer',
+              }}
+            >
+              重新生成（忽略缓存）
+            </button>
+          </div>
+        )}
         {status === 'failed' && (
           <div style={{ marginTop: 6, fontSize: 11, color: 'var(--canvas-danger)' }}>
             {data.runtime.error ?? '生成失败'}

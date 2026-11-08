@@ -10,6 +10,7 @@ const MENU_GROUPS: MenuGroup[] = [
     items: [
       { type: 'prompt', description: '文本提示词，可 AI 生成' },
       { type: 'image-gen', description: '文生图 / 图生图' },
+      { type: 'image-edit', description: '修图精修，保持角色一致' },
       { type: 'image-view', description: '展示图片结果' },
       { type: 'video-gen', description: '文生视频 / 图生视频' },
       { type: 'video-view', description: '展示视频结果' },

@@ -32,6 +32,7 @@ import requests
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from modules.media_pipeline import MediaError, MediaPipeline, number
+from modules.speech_service import SpeechService
 from modules.studio_service import StudioService, StudioValidationError, normalize_production
 
 
@@ -198,7 +199,7 @@ class PublicMediaDownloader:
 
 
 class GenerationService:
-    KINDS = {'image-gen': 'image', 'video-gen': 'video', 'audio-gen': 'audio', 'compose': 'compose'}
+    KINDS = {'image-gen': 'image', 'image-edit': 'image', 'video-gen': 'video', 'audio-gen': 'audio', 'compose': 'compose'}
 
     def __init__(self, db_path, settings=None):
         self.db_path = Path(db_path).resolve()
@@ -206,7 +207,8 @@ class GenerationService:
         self.media_dir = self.db_path.parent / 'studio-media'
         self.media_dir.mkdir(exist_ok=True)
         self.settings = dict(os.environ if settings is None else settings)
-        self.pipeline = MediaPipeline(self.media_dir)
+        self.speech = SpeechService(self.db_path.parent / 'models' / 'whisper', settings=self.settings)
+        self.pipeline = MediaPipeline(self.media_dir, transcriber=self.speech.transcribe)
         self.downloader = PublicMediaDownloader(self.media_dir)
         self.providers = {kind: self._provider(kind) for kind in ('text', 'image', 'video', 'audio')}
         self._lock = threading.RLock()
@@ -226,7 +228,11 @@ class GenerationService:
                 request_hash TEXT NOT NULL, outputs_json TEXT NOT NULL DEFAULT '[]',
                 error TEXT NOT NULL DEFAULT '', provider_id TEXT NOT NULL DEFAULT '',
                 retry_of TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)''')
+            columns = {row[1] for row in connection.execute('PRAGMA table_info(generation_jobs)')}
+            if 'content_hash' not in columns:
+                connection.execute("ALTER TABLE generation_jobs ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
             connection.execute('CREATE INDEX IF NOT EXISTS idx_generation_project ON generation_jobs(project_id, created_at DESC)')
+            connection.execute('CREATE INDEX IF NOT EXISTS idx_generation_content ON generation_jobs(content_hash, status)')
             # Deliberately do not resubmit interrupted jobs; the supplier may have
             # already accepted/billed a POST whose result was never persisted.
             connection.execute("UPDATE generation_jobs SET status='failed',error=?,updated_at=? WHERE status IN ('queued','running')",
@@ -255,7 +261,8 @@ class GenerationService:
             # loopback relays are allowed. Credentials in URL are forbidden.
             if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
                 configured = False
-            if protocol not in ('openai', 'seedance') or (kind != 'video' and protocol != 'openai'):
+            allowed_protocols = {'video': ('openai', 'seedance'), 'audio': ('openai', 'clone')}
+            if protocol not in allowed_protocols.get(kind, ('openai',)):
                 configured = False
         models = [entry.strip() for entry in (read('MODELS') or model).split(',') if entry.strip()]
         return {'base_url': base.rstrip('/'), 'key': key, 'model': model, 'protocol': protocol,
@@ -282,16 +289,18 @@ class GenerationService:
 
     def audio_meta(self):
         provider = self.providers['audio']
+        cloning = provider['protocol'] == 'clone'
         voices = str(self.settings.get('AUDIO_VOICES') or 'alloy,echo,fable,onyx,nova,shimmer').split(',')
-        return {'configured': provider['configured'],
+        return {'configured': provider['configured'], 'protocol': provider['protocol'], 'cloning': cloning,
                 'models': [{'id': model, 'label': model, 'name': model, 'credits_per_100_chars': 0} for model in provider['models']] if provider['configured'] else [],
-                'voices': [{'id': voice.strip(), 'label': voice.strip(), 'name': voice.strip()} for voice in voices if voice.strip()] if provider['configured'] else []}
+                'voices': [{'id': voice.strip(), 'label': voice.strip(), 'name': voice.strip()} for voice in voices if voice.strip()] if provider['configured'] and not cloning else []}
 
     def settings_status(self):
         public = {kind: {'configured': provider['configured'], 'model': provider['model'],
                          'models': provider['models'] if provider['configured'] else []}
                   for kind, provider in self.providers.items()}
         return {'providers': public, 'ffmpeg': {'available': self.pipeline.available},
+                'subtitles': self.speech.status(),
                 'config_path': str(Path(__file__).resolve().parents[2] / '.env'),
                 'image_models': self.image_models(), 'video_models': self.video_models(), 'audio': self.audio_meta()}
 
@@ -346,23 +355,24 @@ class GenerationService:
         if not isinstance(node_type, str) or node_type not in self.KINDS:
             if not any(self.providers[kind]['configured'] for kind in ('image', 'video', 'audio')):
                 raise GenerationError('尚未配置生成供应商，请先在本地 .env 中配置', 503)
-            raise GenerationError('node_type 必须是 image-gen、video-gen、audio-gen 或 compose')
+            raise GenerationError('node_type 必须是 image-gen、image-edit、video-gen、audio-gen 或 compose')
         kind = self.KINDS[node_type]
         if kind != 'compose':
             self.require_provider(kind)
         params, inputs = payload.get('params', {}), payload.get('inputs', {})
         if not isinstance(params, dict) or not isinstance(inputs, dict):
             raise GenerationError('params 和 inputs 必须是对象')
-        allowed = {'image': {'prompt': 4, 'ref': 6}, 'video': {'prompt': 2, 'first': 1, 'last': 1},
-                   'audio': {'text': 1}, 'compose': {'video': 1, 'audio': 2}}[kind]
+        allowed = {'image-gen': {'prompt': 4, 'ref': 6}, 'image-edit': {'image': 1, 'prompt': 1, 'ref': 4},
+                   'video-gen': {'prompt': 2, 'first': 1, 'last': 1}, 'audio-gen': {'text': 1, 'ref': 1},
+                   'compose': {'video': 1, 'audio': 2}}[node_type]
         for name, values in inputs.items():
             if name not in allowed or not isinstance(values, list) or len(values) > allowed[name]:
                 raise GenerationError('输入端口或输入数量无效')
             for value in values:
                 _text(value, name)
-                if name in ('ref', 'first', 'last', 'video', 'audio'):
+                if name in ('ref', 'first', 'last', 'video', 'audio', 'image'):
                     self.pipeline.resolve_media(value)
-                if name in ('ref', 'first', 'last'):
+                if name in ('ref', 'first', 'last', 'image') and kind != 'audio':
                     self._image_data(value)
         params = dict(params)
         if kind != 'compose':
@@ -372,14 +382,22 @@ class GenerationService:
                 raise GenerationError('请连接文本或提示词输入')
             _text('\n'.join(inputs[text_key]), text_key, 4000 if kind == 'audio' else 32000)
         if kind == 'image':
-            count = number(params.get('count', 1), '图片数量', 1, 4)
-            if int(count) != count:
-                raise GenerationError('图片数量必须是整数')
-            params['count'] = int(count)
-            ratio = params.get('ratio') or params.get('aspectRatio') or '1:1'
-            if ratio not in ('1:1', '16:9', '9:16', '4:3', '3:4'):
-                raise GenerationError('图片比例不支持')
-            params['ratio'] = ratio
+            if node_type == 'image-edit':
+                # 修图保持原图画幅：单张输出，忽略比例参数。
+                if not inputs.get('image'):
+                    raise GenerationError('修图节点需要连接待编辑图片（in:image 端口）')
+                params['count'] = 1
+                params.pop('ratio', None)
+                params.pop('aspectRatio', None)
+            else:
+                count = number(params.get('count', 1), '图片数量', 1, 4)
+                if int(count) != count:
+                    raise GenerationError('图片数量必须是整数')
+                params['count'] = int(count)
+                ratio = params.get('ratio') or params.get('aspectRatio') or '1:1'
+                if ratio not in ('1:1', '16:9', '9:16', '4:3', '3:4'):
+                    raise GenerationError('图片比例不支持')
+                params['ratio'] = ratio
         if kind == 'video':
             protocol = self.providers['video']['protocol']
             duration = number(params.get('durationSeconds', 4 if protocol == 'openai' else 5), '视频时长', 1, 30)
@@ -401,10 +419,16 @@ class GenerationService:
             params['emotion'] = _text(params.get('emotion') or '', '配音情绪', 500, True)
             if params['emotion'] and params['model'] in ('tts-1', 'tts-1-hd'):
                 raise GenerationError('tts-1 系列不支持情绪指令，请清空情绪或选择支持 instructions 的配音模型')
-            voice = params.get('voiceId') or params.get('voice_id') or self.audio_meta()['voices'][0]['id']
-            if voice not in {entry['id'] for entry in self.audio_meta()['voices']}:
-                raise GenerationError('音色未在本地 AUDIO_VOICES 中配置')
-            params['voiceId'] = voice
+            params['voiceReferenceText'] = _text(params.get('voiceReferenceText') or '', '参考音频文本', 2000, True)
+            if self.providers['audio']['protocol'] == 'clone':
+                # Clone protocol reads the character reference audio from the in:ref port.
+                if not inputs.get('ref'):
+                    raise GenerationError('声音克隆需要连接角色参考音频（配音节点的参考音频端口）')
+            else:
+                voice = params.get('voiceId') or params.get('voice_id') or self.audio_meta()['voices'][0]['id']
+                if voice not in {entry['id'] for entry in self.audio_meta()['voices']}:
+                    raise GenerationError('音色未在本地 AUDIO_VOICES 中配置')
+                params['voiceId'] = voice
         if kind == 'compose':
             self.pipeline.validate_export({'clips': [{'url': url, 'subtitle': params.get('subtitle', '')} for url in inputs.get('video', [])],
                                            'audio_urls': inputs.get('audio', []), 'resolution': params.get('resolution', '720p'), 'aspect_ratio': params.get('ratio', '16:9')})
@@ -422,9 +446,17 @@ class GenerationService:
             replay = self._replay(payload['client_run_id'], payload)
             if replay:
                 return {'jobs': [{'kind': replay['kind'], 'id': replay['id']}], 'credits_cost': 0}
+        if 'force' in payload and not isinstance(payload['force'], bool):
+            raise GenerationError('force 必须是布尔值')
         kind, normalized = self._validate_node(payload)
         job = self._submit(kind, normalized, original=payload)
         return {'jobs': [{'kind': kind, 'id': job['id']}], 'credits_cost': 0}
+
+    @staticmethod
+    def _content_hash(normalized):
+        """Cache key over generation content only: type, params and resolved inputs."""
+        material = {key: normalized.get(key) for key in ('node_type', 'params', 'inputs')}
+        return hashlib.sha256(_json(material).encode()).hexdigest()
 
     def _replay(self, client_run_id, original):
         try:
@@ -439,12 +471,35 @@ class GenerationService:
             return self._job(row)
         return None
 
+    def _serve_cached(self, kind, payload, original):
+        """Reuse a previous identical success so unchanged inputs are not billed twice.
+
+        Returns the new completed job or None. The caller holds self._lock.
+        """
+        if original.get('force') or kind not in ('image', 'video', 'audio', 'compose'):
+            return None
+        content_hash = self._content_hash(payload)
+        with self._connection() as connection:
+            row = connection.execute("SELECT id, outputs_json FROM generation_jobs WHERE content_hash=? AND status='succeeded' AND kind=? ORDER BY updated_at DESC LIMIT 1",
+                                     (content_hash, kind)).fetchone()
+            if row is None:
+                return None
+            job_id, stamp = uuid.uuid4().hex, _now()
+            connection.execute('''INSERT INTO generation_jobs(id,kind,status,node_id,project_id,client_run_id,request_json,request_hash,outputs_json,error,provider_id,retry_of,content_hash,created_at,updated_at)
+                                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                               (job_id, kind, 'succeeded', payload.get('node_id', ''), payload.get('project_id', ''), payload['client_run_id'],
+                                _json(payload), hashlib.sha256(_json(original).encode()).hexdigest(), row['outputs_json'], '', 'cache:' + row['id'], '', content_hash, stamp, stamp))
+        return self.get_job(job_id)
+
     def _submit(self, kind, payload, original=None, retry_of=''):
         original = original if original is not None else payload
         with self._lock:
             replay = self._replay(payload['client_run_id'], original)
             if replay:
                 return replay
+            cached = self._serve_cached(kind, payload, original)
+            if cached is not None:
+                return cached
             if self._closed:
                 raise GenerationError('任务执行器已关闭，请重启应用', 503)
             if not self._slots.acquire(blocking=False):
@@ -453,10 +508,10 @@ class GenerationService:
             cancel = threading.Event()
             try:
                 with self._connection() as connection:
-                    connection.execute('''INSERT INTO generation_jobs(id,kind,status,node_id,project_id,client_run_id,request_json,request_hash,outputs_json,error,provider_id,retry_of,created_at,updated_at)
-                                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    connection.execute('''INSERT INTO generation_jobs(id,kind,status,node_id,project_id,client_run_id,request_json,request_hash,outputs_json,error,provider_id,retry_of,content_hash,created_at,updated_at)
+                                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                                        (job_id, kind, 'queued', payload.get('node_id', ''), payload.get('project_id', ''), payload['client_run_id'],
-                                        _json(payload), hashlib.sha256(_json(original).encode()).hexdigest(), '[]', '', '', retry_of, stamp, stamp))
+                                        _json(payload), hashlib.sha256(_json(original).encode()).hexdigest(), '[]', '', '', retry_of, self._content_hash(payload), stamp, stamp))
                 self._cancel[job_id] = cancel
                 future = self._executor.submit(self._execute, job_id, kind, payload, cancel)
                 self._futures[job_id] = future
@@ -538,9 +593,15 @@ class GenerationService:
 
     def submit_export(self, payload):
         self.pipeline.validate_export(payload)
+        if payload.get('auto_subtitles') and not self.speech.available:
+            raise GenerationError('自动字幕需要本机安装 faster-whisper：'
+                                  '.venv\\Scripts\\python.exe -m pip install faster-whisper，安装后重启应用', 400)
         if not self.pipeline.available:
             raise GenerationError('FFmpeg 未安装，暂时无法导出', 503)
-        normalized = {key: payload[key] for key in ('clips', 'audio_urls', 'aspect_ratio', 'resolution', 'fps') if key in payload}
+        normalized = {key: payload[key] for key in ('clips', 'audio_urls', 'aspect_ratio', 'resolution', 'fps',
+                                                    'auto_subtitles') if key in payload}
+        if 'subtitle_language' in payload:
+            normalized['subtitle_language'] = str(payload['subtitle_language'] or '').strip().lower()
         normalized.update(project_id=_identifier(payload.get('project_id'), 'project_id'), node_id='',
                           client_run_id=_identifier(payload.get('client_run_id') or 'export-' + uuid.uuid4().hex, 'client_run_id'))
         return self._submit('export', normalized)
@@ -618,17 +679,26 @@ class GenerationService:
 
     def _image(self, payload, cancel):
         params, inputs = payload['params'], payload['inputs']
-        sizes = {'1:1': '1024x1024', '16:9': '1536x1024', '4:3': '1536x1024', '9:16': '1024x1536', '3:4': '1024x1536'}
-        request = {'model': params['model'], 'prompt': '\n'.join(inputs['prompt']), 'n': params['count'], 'size': sizes[params['ratio']]}
-        references = inputs.get('ref', [])
-        if references:
+        if payload.get('node_type') == 'image-edit':
+            # 修图：待编辑图片在前，角色/场景参考图随后，保持原图画幅。
+            request = {'model': params['model'], 'prompt': '\n'.join(inputs['prompt']), 'n': 1}
             files = []
-            for reference in references:
+            for reference in [inputs['image'][0], *inputs.get('ref', [])]:
                 data, mime, filename = self._image_data(reference)
                 files.append(('image[]', (filename, data, mime)))
             result = self._request_json('image', '/images/edits', payload=request, files=files)
         else:
-            result = self._request_json('image', '/images/generations', payload=request)
+            sizes = {'1:1': '1024x1024', '16:9': '1536x1024', '4:3': '1536x1024', '9:16': '1024x1536', '3:4': '1024x1536'}
+            request = {'model': params['model'], 'prompt': '\n'.join(inputs['prompt']), 'n': params['count'], 'size': sizes[params['ratio']]}
+            references = inputs.get('ref', [])
+            if references:
+                files = []
+                for reference in references:
+                    data, mime, filename = self._image_data(reference)
+                    files.append(('image[]', (filename, data, mime)))
+                result = self._request_json('image', '/images/edits', payload=request, files=files)
+            else:
+                result = self._request_json('image', '/images/generations', payload=request)
         entries = result.get('data')
         if not isinstance(entries, list) or not entries or len(entries) > 4:
             raise GenerationError('供应商没有返回有效图片', 502)
@@ -648,8 +718,37 @@ class GenerationService:
                 raise GenerationError('供应商图片数据无效', 502)
         return outputs
 
+    def _clone_language(self, name, default):
+        value = str(self.settings.get(name) or '').strip().lower()
+        if not value or len(value) > 20 or not re.fullmatch(r'[a-z-]+', value):
+            return default
+        return value
+
+    def _clone_request(self, payload):
+        """Build the local voice-clone request (GPT-SoVITS api_v2 compatible /tts)."""
+        params = payload['params']
+        request = {'text': '\n'.join(payload['inputs']['text']),
+                   'text_lang': self._clone_language('AUDIO_TEXT_LANG', 'zh'),
+                   'prompt_lang': self._clone_language('AUDIO_PROMPT_LANG', 'zh'),
+                   'speed_factor': params['speed']}
+        if params.get('voiceReferenceText'):
+            request['prompt_text'] = params['voiceReferenceText']
+        reference = self.pipeline.resolve_media(payload['inputs']['ref'][0])
+        root = str(self.settings.get('AUDIO_CLONE_MEDIA_ROOT') or '').strip()
+        if root:
+            # The clone server may mount the media library somewhere else.
+            reference = Path(root) / reference.relative_to(self.media_dir)
+        request['ref_audio_path'] = str(reference)
+        return request
+
     def _audio(self, payload, cancel):
         params = payload['params']
+        if cancel.is_set():
+            raise GenerationError('任务已取消', 409)
+        if self.providers['audio']['protocol'] == 'clone':
+            request = self._clone_request(payload)
+            data, content_type = self._request_binary('audio', '/tts', payload=request)
+            return [self._save(data, 'audio', content_type)]
         request = {'model': params['model'], 'input': '\n'.join(payload['inputs']['text']),
                    'voice': params['voiceId'], 'speed': params['speed'], 'response_format': 'mp3'}
         if params.get('emotion'):
@@ -748,7 +847,7 @@ class GenerationService:
         except StudioValidationError as exc:
             raise GenerationError(str(exc)) from None
         schema = {'kind': 'product|comic', 'brief': 'string', 'style': 'string', 'aspect_ratio': '16:9|9:16|1:1', 'duration_seconds': 15,
-                  'script': 'string', 'characters': [{'id': 'c1', 'name': 'string', 'description': 'string', 'reference_asset_ids': [], 'voice_id': ''}],
+                  'script': 'string', 'characters': [{'id': 'c1', 'name': 'string', 'description': 'string', 'appearance': 'string', 'outfit': 'string', 'identity_locked': False, 'reference_asset_ids': [], 'voice_id': ''}],
                   'scenes': [{'id': 'scene1', 'name': 'string', 'description': 'string', 'reference_asset_ids': []}],
                   'episodes': [{'id': 'ep1', 'title': 'string', 'synopsis': 'string', 'script': 'string'}],
                   'shots': [{'id': 's1', 'episode_id': 'ep1', 'title': 'string', 'description': 'string', 'image_prompt': 'string', 'video_prompt': 'string', 'dialogue': 'string',
@@ -773,11 +872,13 @@ class GenerationService:
         brief = _text(brief, 'brief', 20000)
         context = normalize_production(production) if production is not None else None
         system = ('你是画布工作流规划器。返回 JSON {title,nodes,edges}。nodes 形如 {id,type,title,text?,params?,x,y}，'
-                  '只允许 prompt,image-gen,image-view,video-gen,video-view,audio-gen,audio-view,compose。'
+                  '只允许 prompt,image-gen,image-edit,image-view,video-gen,video-view,audio-gen,audio-view,compose。'
                   'edges 形如 {source,target,targetHandle,data:{order,mediaType}}。所有 ID 必须存在，不可循环，必须匹配端口。'
-                  'prompt 输出 text；image-gen 的 in:prompt 接 text，in:ref 接 image；image-view 的 in:media 接 image；'
+                  'prompt 输出 text；image-gen 的 in:prompt 接 text，in:ref 接 image；'
+                  'image-edit 的 in:image 接待编辑图片，in:prompt 接编辑指令，in:ref 接角色参考图；image-view 的 in:media 接 image；'
                   'video-gen 的 in:prompt 接 text，in:first/in:last 接 image；video-view 的 in:media 接 video；'
-                  'audio-gen 的 in:text 接 text，audio-view 的 in:media 接 audio；compose 的 in:video 接 video，in:audio 接 audio。')
+                  'audio-gen 的 in:text 接 text，可选 in:ref 接参考音频（声音克隆）；audio-view 的 in:media 接 audio；'
+                  'compose 的 in:video 接 video，in:audio 接 audio。')
         result = self._completion(system, _json({'brief': brief, 'production': context}), True)
         try:
             title = _text(result.get('title'), 'plan.title', 200)

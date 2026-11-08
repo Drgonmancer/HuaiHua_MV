@@ -7,6 +7,7 @@ export type NodeKind =
   | 'prompt'
   | 'asset'
   | 'image-gen'
+  | 'image-edit'
   | 'image-view'
   | 'video-gen'
   | 'video-view'
@@ -41,6 +42,8 @@ export type NodeRuntime = {
   creditsCost?: number
   startedAt?: string
   finishedAt?: string
+  /** 结果来自内容缓存（输入未变化，未产生新的供应商费用） */
+  cached?: boolean
 }
 
 export type NodeParams = {
@@ -53,6 +56,7 @@ export type NodeParams = {
   useLastFrame?: boolean
   mode?: 'tts' | 'bgm' | 'sfx'
   voiceId?: string
+  voiceReferenceText?: string
   speed?: number
   emotion?: string
 }
@@ -65,6 +69,8 @@ export type CanvasNodeData = {
   outputs?: NodeOutput[]
   selectedOutput?: number
   runtime: NodeRuntime
+  /** 最近一次成功运行的内容指纹与产物；输入未变化时复用，不重新计费 */
+  lastRun?: { fingerprint: string; outputs: NodeOutput[]; at: string }
   [key: string]: unknown
 }
 

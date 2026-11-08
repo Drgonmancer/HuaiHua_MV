@@ -31,11 +31,22 @@ def number(value, name, minimum=0, maximum=3600):
 
 
 class MediaPipeline:
-    def __init__(self, media_dir, ffmpeg=None, ffprobe=None):
+    def __init__(self, media_dir, ffmpeg=None, ffprobe=None, transcriber=None):
         self.media_dir = Path(media_dir).resolve()
         self.media_dir.mkdir(parents=True, exist_ok=True)
-        self.ffmpeg = ffmpeg or shutil.which('ffmpeg')
-        self.ffprobe = ffprobe or shutil.which('ffprobe')
+        local_bin = Path(__file__).resolve().parents[2] / '.local' / 'ffmpeg' / 'bin'
+
+        def _binary(explicit, name):
+            found = explicit or shutil.which(name)
+            if found:
+                return found
+            candidate = local_bin / (name + '.exe')
+            return str(candidate) if candidate.is_file() else None
+
+        self.ffmpeg = _binary(ffmpeg, 'ffmpeg')
+        self.ffprobe = _binary(ffprobe, 'ffprobe')
+        # Optional speech-to-text callable (audio_path, language, cancel) -> cues.
+        self.transcriber = transcriber
 
     @property
     def available(self):
@@ -138,24 +149,86 @@ class MediaPipeline:
         if not isinstance(audio, list) or len(audio) > 8:
             raise MediaError('最多混合 8 段音频')
         audio_paths = [self.resolve_media(url) for url in audio]
+        self.subtitle_options(payload)
         return validated, audio_paths, width, height, fps
+
+    @staticmethod
+    def subtitle_options(payload):
+        """Validate auto subtitle options shared by export validation and run."""
+        auto = payload.get('auto_subtitles', False)
+        if not isinstance(auto, bool):
+            raise MediaError('auto_subtitles 必须是布尔值')
+        language = payload.get('subtitle_language', '')
+        if not isinstance(language, str) or len(language) > 20:
+            raise MediaError('字幕语言无效')
+        return auto, language.strip().lower()
 
     @staticmethod
     def _timestamp(seconds):
         millis = int(round(seconds * 1000))
         return f'{millis//3600000:02}:{millis//60000%60:02}:{millis//1000%60:02},{millis%1000:03}'
 
+    @staticmethod
+    def _sanitize_subtitle(text):
+        """Strip cue delimiters and control characters from untrusted subtitle text."""
+        return ''.join(c for c in text if c >= ' ' or c == '\n').replace('-->', '→').strip()
+
+    def _transcribe_joined(self, joined, workspace, total, language, cancel):
+        """Transcribe the joined audio track; cues share the timeline of the final cut."""
+        if not callable(self.transcriber):
+            raise MediaError('自动字幕需要本机安装 faster-whisper，请先安装并重启应用，或关闭自动字幕', 400)
+        if total > 3600:
+            raise MediaError('自动字幕不支持超过 60 分钟的成片', 400)
+        audio = workspace / 'transcript.wav'
+        self._run([self.ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-protocol_whitelist', 'file,pipe',
+                   '-i', str(joined), '-vn', '-ac', '1', '-ar', '16000', str(audio)], cancel, workspace)
+        if cancel is not None and cancel.is_set():
+            raise MediaError('任务已取消', 409)
+        raw = self.transcriber(audio, language, cancel)
+        if not isinstance(raw, list):
+            raise MediaError('自动字幕转写结果无效', 422)
+        cues = []
+        for entry in raw[:2000]:
+            if not isinstance(entry, dict):
+                continue
+            start, end = number(entry.get('start'), '字幕起点', 0, 3600), number(entry.get('end'), '字幕终点', 0, 3600)
+            text = self._sanitize_subtitle(str(entry.get('text') or ''))[:2000]
+            if not text:
+                continue
+            if end <= start:
+                end = start + .5
+            cues.append({'start': min(start, total), 'end': min(end, total), 'text': text})
+        return cues
+
+    @staticmethod
+    def _merge_subtitles(manual, auto):
+        """Auto cues win on overlap; manual cues fill clips the transcript missed."""
+        if not auto:
+            return list(manual), 'manual'
+        merged = [dict(cue) for cue in auto]
+        kept_manual = False
+        for cue in manual:
+            start, end = cue['start'], cue['end']
+            if any(not (cue['end'] <= entry['start'] + .01 or cue['start'] >= entry['end'] - .01) for entry in auto):
+                continue
+            merged.append(dict(cue))
+            kept_manual = True
+        merged.sort(key=lambda cue: (cue['start'], cue['end']))
+        return merged, 'auto' if not kept_manual else 'mixed'
+
     def export(self, payload, cancel=None):
         if not self.available:
             raise MediaError('未找到 FFmpeg 和 ffprobe，请安装后重启', 503)
         clips, audio_paths, width, height, fps = self.validate_export(payload)
+        auto, language = self.subtitle_options(payload)
         filename = uuid.uuid4().hex + '.mp4'
         output = self.media_dir / filename
         try:
             with tempfile.TemporaryDirectory(prefix='export-', dir=self.media_dir) as temp:
                 workspace = Path(temp)
-                durations, subtitles = [], []
+                durations, manual_texts = [], []
                 total = 0.0
+                ranges = []
                 for index, clip in enumerate(clips):
                     info = self.probe(clip['path'])
                     streams = info.get('streams', [])
@@ -167,10 +240,8 @@ class MediaPipeline:
                     if length <= .04 or total + length > 3600:
                         raise MediaError('剪辑范围超出素材，或成片超过 60 分钟')
                     durations.append(length)
-                    if clip['subtitle'].strip():
-                        # Strip cue delimiters and control characters from untrusted subtitle text.
-                        text = ''.join(c for c in clip['subtitle'] if c >= ' ' or c == '\n').replace('-->', '→').strip()
-                        subtitles.append(f'{len(subtitles)+1}\n{self._timestamp(total)} --> {self._timestamp(total+length)}\n{text}\n')
+                    manual_texts.append(clip['subtitle'])
+                    ranges.append((total, total + length))
                     total += length
                     command = [self.ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-protocol_whitelist', 'file,pipe',
                                '-ss', str(clip['start']), '-i', str(clip['path'])]
@@ -182,17 +253,25 @@ class MediaPipeline:
                                 '-r', str(fps), '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', '-pix_fmt', 'yuv420p',
                                 '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-threads', '2', str(workspace / f'clip{index}.mp4')]
                     self._run(command, cancel, workspace)
+                manual_cues = [{'start': start, 'end': start + length, 'text': self._sanitize_subtitle(text)}
+                               for (start, _range_end), length, text in zip(ranges, durations, manual_texts) if text.strip()]
                 (workspace / 'concat.txt').write_text('\n'.join(f"file 'clip{index}.mp4'" for index in range(len(clips))), encoding='utf-8')
                 joined = workspace / 'joined.mp4'
                 self._run([self.ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-protocol_whitelist', 'file,pipe',
                            '-f', 'concat', '-safe', '1', '-i', 'concat.txt', '-c', 'copy', str(joined)], cancel, workspace)
+                if auto:
+                    cues, subtitle_source = self._merge_subtitles(manual_cues, self._transcribe_joined(joined, workspace, total, language, cancel))
+                else:
+                    cues, subtitle_source = manual_cues, 'manual'
                 command = [self.ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-protocol_whitelist', 'file,pipe', '-i', str(joined)]
                 for audio in audio_paths:
                     if not any(stream['codec_type'] == 'audio' for stream in self.probe(audio).get('streams', [])):
                         raise MediaError('混音素材没有音频轨道', 422)
                     command += ['-protocol_whitelist', 'file,pipe', '-i', str(audio)]
-                if subtitles:
-                    (workspace / 'subtitles.srt').write_text('\n'.join(subtitles), encoding='utf-8')
+                if cues:
+                    (workspace / 'subtitles.srt').write_text('\n'.join(
+                        f'{index}\n{self._timestamp(cue["start"])} --> {self._timestamp(cue["end"])}\n{cue["text"]}\n'
+                        for index, cue in enumerate(cues, 1)), encoding='utf-8')
                     command += ['-i', 'subtitles.srt']
                 command += ['-map', '0:v:0']
                 if audio_paths:
@@ -200,15 +279,16 @@ class MediaPipeline:
                     command += ['-filter_complex', f'{inputs}amix=inputs={len(audio_paths)+1}:duration=first:dropout_transition=0:normalize=1[mix]', '-map', '[mix]']
                 else:
                     command += ['-map', '0:a:0']
-                if subtitles:
+                if cues:
                     command += ['-map', f'{len(audio_paths)+1}:s:0', '-c:s', 'mov_text', '-metadata:s:s:0', 'language=zho',
                                 '-vf', "subtitles=subtitles.srt:force_style='FontName=Microsoft YaHei,FontSize=20,Outline=1'"]
-                command += ['-t', str(total), '-c:v', 'libx264' if subtitles else 'copy', '-c:a', 'aac',
+                command += ['-t', str(total), '-c:v', 'libx264' if cues else 'copy', '-c:a', 'aac',
                             '-movflags', '+faststart', '-threads', '2', str(output)]
                 self._run(command, cancel, workspace)
             return {'kind': 'video', 'url': '/studio-media/' + filename,
                     'meta': {'duration_seconds': total, 'width': width, 'height': height, 'fps': fps,
-                             'clips': len(clips), 'subtitles': bool(subtitles)}}
+                             'clips': len(clips), 'subtitles': bool(cues), 'subtitle_source': subtitle_source,
+                             'subtitle_cues': len(cues)}}
         except (OSError, MediaError):
             output.unlink(missing_ok=True)
             raise

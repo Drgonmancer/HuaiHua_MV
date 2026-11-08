@@ -9,6 +9,7 @@
 import { api, ApiError } from '../api/client'
 import { useFlowStore, createNode, newId } from '../store/flowStore'
 import { topoAncestors, topoSort, GEN_NODE_TYPES } from './graph'
+import { nodeFingerprint } from './fingerprint'
 import type { CanvasNode, NodeOutput, NodeKind } from '../types'
 import { useProjectStore } from '../store/projectStore'
 
@@ -16,6 +17,7 @@ type JobKindName = 'image' | 'video' | 'audio' | 'compose'
 
 const JOB_KIND: Partial<Record<NodeKind, JobKindName>> = {
   'image-gen': 'image',
+  'image-edit': 'image',
   'video-gen': 'video',
   'audio-gen': 'audio',
   compose: 'compose',
@@ -23,6 +25,7 @@ const JOB_KIND: Partial<Record<NodeKind, JobKindName>> = {
 
 const VIEW_TYPE: Partial<Record<NodeKind, NodeKind>> = {
   'image-gen': 'image-view',
+  'image-edit': 'image-view',
   'video-gen': 'video-view',
   'audio-gen': 'audio-view',
   compose: 'video-view',
@@ -232,7 +235,7 @@ async function pollJobs(nodeId: string, jobs: RunJob[]): Promise<boolean> {
 }
 
 /** 执行单个生成节点，等待到成功/失败。返回是否成功。 */
-export async function executeNode(nodeId: string): Promise<boolean> {
+export async function executeNode(nodeId: string, options?: { force?: boolean }): Promise<boolean> {
   const node = getNode(nodeId)
   if (!node) return false
   const kind = JOB_KIND[node.type as NodeKind]
@@ -259,6 +262,20 @@ export async function executeNode(nodeId: string): Promise<boolean> {
       )
       return false
     }
+  }
+
+  // 内容缓存：输入未变化时复用上次成功结果，不重新提交供应商请求。
+  const fingerprint = nodeFingerprint(node.type, node.data.params, inputs)
+  const lastRun = node.data.lastRun
+  if (!options?.force && (status === 'succeeded' || status === 'stale')
+    && lastRun?.fingerprint === fingerprint && lastRun.outputs.length) {
+    useFlowStore.getState().updateNodeData(nodeId, {
+      outputs: lastRun.outputs,
+      runtime: { ...node.data.runtime, status: 'succeeded', cached: true, error: undefined },
+    })
+    ensureViewNode(nodeId)
+    pushToast('输入未变化，复用上次结果（未产生新的供应商费用）', 'info')
+    return true
   }
 
   const clientRunId = newId('run')
@@ -298,8 +315,18 @@ export async function executeNode(nodeId: string): Promise<boolean> {
       jobIds: result.jobs.map((j) => j.id),
       jobId: result.jobs[0]?.id,
       creditsCost: result.credits_cost,
+      cached: false,
     })
-    return await pollJobs(nodeId, result.jobs)
+    const ok = await pollJobs(nodeId, result.jobs)
+    if (ok) {
+      const finished = getNode(nodeId)
+      if (finished) {
+        useFlowStore.getState().updateNodeData(nodeId, {
+          lastRun: { fingerprint, outputs: finished.data.outputs ?? [], at: new Date().toISOString() },
+        })
+      }
+    }
+    return ok
   } catch (error) {
     const current = getNode(nodeId)
     if (!current || current.data.runtime.clientRunId !== clientRunId || current.data.runtime.status === 'stale') return false
@@ -322,9 +349,9 @@ export async function executeNode(nodeId: string): Promise<boolean> {
   }
 }
 
-/** 单节点运行（fire-and-forget，供节点按钮直接调用） */
-export function runNode(nodeId: string): void {
-  void executeNode(nodeId)
+/** 单节点运行（fire-and-forget，供节点按钮直接调用）；force=true 忽略缓存强制重跑 */
+export function runNode(nodeId: string, options?: { force?: boolean }): void {
+  void executeNode(nodeId, options)
 }
 
 /** 运行到此节点：拓扑序执行 自身+全部未成功/过期 的生成类祖先 */

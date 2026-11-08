@@ -120,6 +120,14 @@ def create_app(settings=None):
 
 
 def open_when_ready(url):
+    """Poll the local health endpoint, then open the browser.
+
+    Only loopback URLs constructed by this module are ever polled; any other
+    host is rejected before a request is made.
+    """
+    parsed = urlsplit(url)
+    if parsed.scheme not in ('http', 'https') or parsed.hostname not in {'127.0.0.1', 'localhost', '::1'}:
+        return
     for _ in range(50):
         try:
             with urlopen(url + 'health', timeout=1) as response:
@@ -137,5 +145,6 @@ if __name__ == '__main__':
     args = parser.parse_args()
     application = create_app()
     if args.open:
-        threading.Thread(target=open_when_ready, args=(f'http://127.0.0.1:{args.port}/',), daemon=True).start()
+        # The URL is loopback-only by construction; open_when_ready validates it again.
+        threading.Thread(target=open_when_ready, args=(f'http://127.0.0.1:{int(args.port)}/',), daemon=True).start()
     application.run(host='127.0.0.1', port=args.port, debug=False, use_reloader=False)

@@ -10,6 +10,7 @@ export const NODE_TYPE_META: Record<
   prompt: { icon: '≡', label: '提示词', accent: '#fbbf24' },
   asset: { icon: '🖼', label: '参考图', accent: '#34d399' },
   'image-gen': { icon: '✦', label: '文生图', accent: '#7c5cff' },
+  'image-edit': { icon: '✎', label: '修图', accent: '#7c5cff' },
   'image-view': { icon: '📷', label: '图片视图', accent: '#60a5fa' },
   'video-gen': { icon: '🎬', label: '视频生成', accent: '#7c5cff' },
   'video-view': { icon: '▶', label: '视频视图', accent: '#60a5fa' },
@@ -29,6 +30,11 @@ const PORT_LABELS: Record<string, string> = {
   'in:text': '文本',
   'in:video': '视频',
   'in:audio': '音频',
+}
+
+function portLabel(type: NodeKind, handle: string): string {
+  if (handle === 'in:ref' && type === 'audio-gen') return '参考音频'
+  return PORT_LABELS[handle] ?? handle
 }
 
 type NodeShellProps = {
@@ -106,7 +112,7 @@ export function NodeShell({ type, selected, width = 260, children, hideSource, t
                     pointerEvents: 'none',
                   }}
                 >
-                  {PORT_LABELS[handleId] ?? handleId}
+                  {portLabel(type, handleId)}
                 </span>
               )}
             </div>

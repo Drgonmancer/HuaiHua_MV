@@ -31,6 +31,10 @@ const NODE_DEFAULTS: Record<NodeKind, () => Partial<CanvasNodeData> & { title: s
     title: '文生图',
     params: { model: 'gpt_image_2', ratio: '1:1', size: '2K', count: 1 },
   }),
+  'image-edit': () => ({
+    title: '修图 · 保持一致',
+    params: { model: 'gpt_image_2' },
+  }),
   'image-view': () => ({ title: '图片视图' }),
   'video-gen': () => ({
     title: '视频生成',
