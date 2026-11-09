@@ -15,6 +15,8 @@ const MENU_GROUPS: MenuGroup[] = [
       { type: 'video-gen', description: '文生视频 / 图生视频' },
       { type: 'video-view', description: '展示视频结果' },
       { type: 'audio-gen', description: '文字转语音 (TTS)' },
+      { type: 'bgm-gen', description: '本地 BGM 配乐生成' },
+      { type: 'lipsync', description: '口型对齐（本地服务）' },
       { type: 'audio-view', description: '播放音频结果' },
     ],
   },

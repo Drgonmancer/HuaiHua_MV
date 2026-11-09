@@ -53,6 +53,17 @@ export const PORT_RULES: Record<NodeKind, NodeRule> = {
       'in:ref': { accepts: ['audio'], max: 1 },
     },
   },
+  'bgm-gen': {
+    produces: 'audio',
+    inputs: { 'in:prompt': { accepts: ['text'], max: 1 } },
+  },
+  lipsync: {
+    produces: 'video',
+    inputs: {
+      'in:video': { accepts: ['video'], max: 1 },
+      'in:audio': { accepts: ['audio'], max: 1 },
+    },
+  },
   'audio-view': {
     produces: 'audio',
     inputs: { 'in:media': { accepts: ['audio'], max: 1 } },

@@ -1,5 +1,6 @@
 import type { ExportRequest, Production, StoryboardResult, StudioJob, TimelineClip } from '../../studioTypes'
-import type { CanvasEdge, CanvasNode, NodeOutput } from '../../types'
+import type { CanvasEdge, CanvasNode, NodeOutput, Viewport } from '../../types'
+import { PORT_RULES } from '../../nodes/portRules'
 
 export function synchronizeTimeline(production: Production): TimelineClip[] {
   const byShot = new Map(production.timeline.map((clip) => [clip.shot_id, clip]))
@@ -26,7 +27,10 @@ export function reorderShots(production: Production, shotId: string, direction: 
   return { ...next, timeline: synchronizeTimeline(next) }
 }
 
-export function prepareStoryboardFragment(result: StoryboardResult, existing: CanvasNode[]): StoryboardResult {
+export function prepareStoryboardFragment<P extends Production | undefined>(
+  result: Pick<StoryboardResult, 'title' | 'nodes' | 'edges'> & { production: P },
+  existing: CanvasNode[],
+): { title: string; nodes: CanvasNode[]; edges: CanvasEdge[]; production: P } {
   const offsetX = existing.length ? Math.max(...existing.map((node) => node.position.x)) + 520 : 80
   const occupied = new Set(existing.map((node) => node.id))
   const idMap = new Map<string, string>()
@@ -48,7 +52,7 @@ export function prepareStoryboardFragment(result: StoryboardResult, existing: Ca
       ...edge, id: `studio-edge-${fragmentId}-${index}`,
       source: idMap.get(edge.source) ?? edge.source, target: idMap.get(edge.target) ?? edge.target,
     })),
-    production: {
+    production: result.production ? {
       ...result.production,
       shots: result.production.shots.map((shot) => ({
         ...shot,
@@ -56,8 +60,73 @@ export function prepareStoryboardFragment(result: StoryboardResult, existing: Ca
           ? Object.fromEntries(Object.entries(shot.node_ids).map(([key, id]) => [key, idMap.get(id) ?? id]))
           : undefined,
       })),
-    },
+    } : result.production,
   }
+}
+
+/** 可分享的画布模板包（.huaihua.json）：节点图快照，运行时状态清零。 */
+export type TemplatePackage = {
+  format: 'huaihua-template'
+  version: 1
+  title: string
+  exported_at: string
+  nodes: CanvasNode[]
+  edges: CanvasEdge[]
+  viewport: Viewport
+}
+
+export function buildTemplatePackage(
+  title: string, nodes: CanvasNode[], edges: CanvasEdge[], viewport: Viewport,
+): TemplatePackage {
+  return {
+    format: 'huaihua-template',
+    version: 1,
+    title: title || '未命名画布',
+    exported_at: new Date().toISOString(),
+    nodes: nodes.map((node) => {
+      const { selected, dragging, measured, ...rest } = node
+      void selected
+      void dragging
+      void measured
+      return { ...rest, data: { ...rest.data, runtime: { status: 'idle' as const } } }
+    }),
+    edges: edges.map((edge) => {
+      const { selected, ...rest } = edge
+      void selected
+      return rest
+    }),
+    viewport,
+  }
+}
+
+export function parseTemplatePackage(raw: string): { nodes: CanvasNode[]; edges: CanvasEdge[]; title: string } {
+  let pkg: unknown
+  try {
+    pkg = JSON.parse(raw)
+  } catch {
+    throw new Error('模板包不是有效的 JSON 文件')
+  }
+  if (!pkg || typeof pkg !== 'object') throw new Error('模板包内容无效')
+  const record = pkg as Record<string, unknown>
+  if (record.format !== 'huaihua-template' || record.version !== 1) {
+    throw new Error('不是槐花MV模板包（缺少 format/version 标识）')
+  }
+  const nodes = record.nodes
+  const edges = record.edges
+  if (!Array.isArray(nodes) || !nodes.length || nodes.length > 1000) {
+    throw new Error('模板包没有有效节点（1-1000 个）')
+  }
+  if (!Array.isArray(edges) || edges.length > 3000) {
+    throw new Error('模板包连线数量超出限制')
+  }
+  if (nodes.some((node) => typeof node !== 'object' || node === null)) {
+    throw new Error('模板包节点数据无效')
+  }
+  const knownTypes = new Set(Object.keys(PORT_RULES))
+  const badType = nodes.find((node) => !knownTypes.has((node as CanvasNode).type ?? ''))
+  if (badType) throw new Error(`模板包包含未知节点类型「${(badType as CanvasNode).type}」，请升级槐花MV后重试`)
+  return { nodes: nodes as CanvasNode[], edges: edges as CanvasEdge[],
+           title: typeof record.title === 'string' ? record.title : '' }
 }
 
 export function mediaForNode(

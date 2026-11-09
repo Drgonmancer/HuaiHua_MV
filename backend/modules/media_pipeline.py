@@ -173,6 +173,34 @@ class MediaPipeline:
         """Strip cue delimiters and control characters from untrusted subtitle text."""
         return ''.join(c for c in text if c >= ' ' or c == '\n').replace('-->', '→').strip()
 
+    def extract_last_frame(self, url, cancel=None):
+        """Extract the final frame of a local video as a PNG continuation frame.
+
+        Used by sequential shot chaining (时序接续): the tail frame of shot N
+        becomes the first-frame input of shot N+1 so characters and scenes stay
+        continuous across cuts.
+        """
+        path = self.resolve_media(url)
+        if not self.available:
+            raise MediaError('未找到 FFmpeg 和 ffprobe，请安装后重启', 503)
+        info = self.probe(path)
+        if not any(stream['codec_type'] == 'video' for stream in info.get('streams', [])):
+            raise MediaError('素材没有视频轨道，无法提取尾帧', 422)
+        duration = number(info.get('format', {}).get('duration'), '视频时长', .01, 3600)
+        output = self.media_dir / (uuid.uuid4().hex + '.png')
+        try:
+            # Seek slightly before the end: seeking exactly to duration can
+            # land past the last decodable frame on some containers.
+            start = max(0.0, duration - 0.2)
+            self._run([self.ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-protocol_whitelist', 'file,pipe',
+                       '-ss', f'{start:.3f}', '-i', str(path), '-frames:v', '1', str(output)], cancel)
+            if not output.is_file() or output.stat().st_size == 0:
+                raise MediaError('尾帧提取失败，视频可能无法解码', 422)
+            return {'kind': 'image', 'url': '/studio-media/' + output.name}
+        except (OSError, MediaError):
+            output.unlink(missing_ok=True)
+            raise
+
     def _transcribe_joined(self, joined, workspace, total, language, cancel):
         """Transcribe the joined audio track; cues share the timeline of the final cut."""
         if not callable(self.transcriber):

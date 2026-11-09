@@ -48,6 +48,14 @@ const NODE_DEFAULTS: Record<NodeKind, () => Partial<CanvasNodeData> & { title: s
     // 默认普通版 tts-1（5 积分/百字），Alloy 中性音
     params: { mode: 'tts', model: 'tts-1', voiceId: 'alloy', speed: 1 },
   }),
+  'bgm-gen': () => ({
+    title: 'BGM 生成',
+    params: { durationSeconds: 30, instrumental: true, lyrics: '' },
+  }),
+  lipsync: () => ({
+    title: '对口型',
+    params: {},
+  }),
   'audio-view': () => ({ title: '音频视图' }),
   compose: () => ({ title: '合成' }),
   group: () => ({ title: '分组' }),

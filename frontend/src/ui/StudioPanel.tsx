@@ -5,7 +5,7 @@ import { useProductionStore } from '../store/productionStore'
 import { useProjectStore } from '../store/projectStore'
 import { syncNow } from '../store/persist'
 import { resumePolling, runToNode } from '../engine/executor'
-import { buildExportRequest, canRetryNodeJob, createProduction, mediaForNode, mediaForShot, prepareStoryboardFragment, reconcileNodeJobs, reorderShots, synchronizeTimeline } from './studio/productionLogic'
+import { buildExportRequest, buildTemplatePackage, canRetryNodeJob, createProduction, mediaForNode, mediaForShot, parseTemplatePackage, prepareStoryboardFragment, reconcileNodeJobs, reorderShots, synchronizeTimeline } from './studio/productionLogic'
 import type { ProductionKind, ProductionShot, StudioAsset, StudioJob, StudioProject, StudioSettings, StudioTemplate } from '../studioTypes'
 import './studio.css'
 
@@ -19,7 +19,7 @@ const TABS: Array<{ id: Tab; label: string }> = [
 const JOB_LABEL: Record<StudioJob['status'], string> = {
   queued: '排队中', running: '处理中', succeeded: '已完成', failed: '失败', canceled: '已取消',
 }
-const KIND_LABEL: Record<string, string> = { image: '图片', video: '视频', audio: '音频', compose: '成片', export: '成片' }
+const KIND_LABEL: Record<string, string> = { image: '图片', video: '视频', audio: '音频', compose: '成片', export: '成片', music: 'BGM', lipsync: '对口型' }
 const CATEGORIES = [
   ['product', '商品'], ['character', '角色'], ['scene', '场景'], ['reference', '参考'], ['video', '视频'], ['audio', '音频'],
 ]
@@ -79,6 +79,8 @@ export function StudioPanel({ onClose }: { onClose: () => void }) {
   const [fps, setFps] = useState(24)
   const [autoSubtitles, setAutoSubtitles] = useState(false)
   const [subtitleLanguage, setSubtitleLanguage] = useState('')
+  const [chainLastFrame, setChainLastFrame] = useState(false)
+  const templateFileInput = useRef<HTMLInputElement>(null)
   const fileInput = useRef<HTMLInputElement>(null)
   const voiceFileInput = useRef<HTMLInputElement>(null)
   const voiceUploadTarget = useRef('')
@@ -191,27 +193,59 @@ export function StudioPanel({ onClose }: { onClose: () => void }) {
     await saveCurrent()
   }
 
-  const runShots = async (shots: ProductionShot[]) => {
+  /** 尾帧续拍（时序接续）：把上一镜头的尾帧注入下一镜头的 first 帧端口。 */
+  const injectContinuationFrame = (videoUrl: string, shot: ProductionShot) => {
+    const flow = useFlowStore.getState()
+    const videoNode = flow.nodes.find((item) => item.id === shot.node_ids?.video)
+    if (!videoNode) return
+    const existing = flow.edges.filter((edge) => edge.target === videoNode.id && edge.targetHandle === 'in:first')
+    if (existing.length) {
+      flow.onEdgesChange(existing.map((edge) => ({ id: edge.id, type: 'remove' as const })))
+    }
+    const frameNode = createNode('asset', { x: videoNode.position.x - 360, y: videoNode.position.y - 160 }, {
+      title: `${shot.title} · 续拍首帧`, mediaType: 'image', value: { url: videoUrl },
+    })
+    const current = useFlowStore.getState()
+    current.addNode(frameNode)
+    current.onConnect({ source: frameNode.id, target: videoNode.id, sourceHandle: 'out', targetHandle: 'in:first' })
+  }
+
+  const runShots = async (shots: ProductionShot[], options?: { chainLastFrame?: boolean }) => {
     if (running || busy) return
     const currentProduction = useProductionStore.getState().production
     if (shots.some((shot) => !shot.node_ids?.video && !shot.node_ids?.compose)) {
       setError('部分镜头尚未搭建，或内容已修改。请重新搭建分镜节点后再运行。')
       return
     }
-    const targets = shots.flatMap((shot) => shot.node_ids?.compose ? [shot.node_ids.compose] : [shot.node_ids?.video, ...(shot.dialogue.trim() ? [shot.node_ids?.audio] : [])]).filter((id): id is string => Boolean(id))
-    if (!targets.length) { setError('请先把分镜搭建为节点，再运行镜头'); return }
     setRunning(true)
     setError('')
     setNotice('镜头正在按依赖顺序执行，可在任务页查看状态。')
     try {
       await saveCurrent()
-      for (const id of targets) {
+      const ordered = [...shots].sort((a, b) => a.order - b.order)
+      let previousVideoUrl: string | undefined
+      const failures: string[] = []
+      for (const shot of ordered) {
         if (useProductionStore.getState().production !== currentProduction) throw new Error('运行期间作品内容发生修改，已停止后续镜头。请重新搭建分镜，再运行当前版本。')
-        await runToNode(id)
+        if (options?.chainLastFrame && previousVideoUrl && shot.node_ids?.video) {
+          const frame = await studioApi.extractFrame(previousVideoUrl)
+          injectContinuationFrame(frame.frame.url, shot)
+        }
+        const targets = shot.node_ids?.compose
+          ? [shot.node_ids.compose]
+          : [shot.node_ids?.video, ...(shot.dialogue.trim() ? [shot.node_ids?.audio] : [])].filter((id): id is string => Boolean(id))
+        for (const id of targets) {
+          await runToNode(id)
+        }
+        const flow = useFlowStore.getState()
+        const videoOutput = mediaForShot(shot, flow.nodes, flow.edges)
+        if (!videoOutput?.url) failures.push(shot.title || shot.id)
+        else previousVideoUrl = videoOutput.url
       }
-      const currentNodes = useFlowStore.getState().nodes
-      const succeeded = targets.filter((id) => currentNodes.find((node) => node.id === id)?.data.runtime.status === 'succeeded').length
-      setNotice(`镜头执行结束：${succeeded}/${targets.length} 个视频或配音节点成功。失败详情见节点和任务页。`)
+      const succeeded = ordered.length - failures.length
+      setNotice(failures.length
+        ? `批量执行结束：${succeeded}/${ordered.length} 个镜头完成；失败镜头：${failures.join('、')}。详情见任务页。`
+        : `批量执行结束：${ordered.length}/${ordered.length} 个镜头全部完成。`)
     } catch (reason) { reportError(reason) } finally { setRunning(false) }
   }
 
@@ -256,6 +290,29 @@ export function StudioPanel({ onClose }: { onClose: () => void }) {
       }
     }
     setNotice(toShot ? `「${asset.name}」已应用到镜头并加入画布` : `「${asset.name}」已加入画布`)
+  }
+
+  const exportTemplatePackage = () => {
+    const flow = useFlowStore.getState()
+    if (!flow.nodes.length) throw new Error('当前画布没有节点，先搭建内容再导出模板包')
+    const pkg = buildTemplatePackage(useProjectStore.getState().title, flow.nodes, flow.edges, flow.viewport)
+    const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: 'application/json' })
+    const anchor = document.createElement('a')
+    anchor.href = URL.createObjectURL(blob)
+    anchor.download = `${(useProjectStore.getState().title || '未命名画布').replace(/[\\/:*?"<>|]/g, '').slice(0, 40) || 'huaihua'}.huaihua.json`
+    anchor.click()
+    URL.revokeObjectURL(anchor.href)
+    setNotice('模板包已导出：可以分享给其他槐花MV用户导入。')
+  }
+
+  const importTemplatePackageFile = async (file: File) => {
+    const raw = await file.text()
+    const pkg = parseTemplatePackage(raw)
+    const fragment = prepareStoryboardFragment({ title: pkg.title || '导入模板', nodes: pkg.nodes, edges: pkg.edges, production: undefined }, useFlowStore.getState().nodes)
+    if (!fragment.nodes.length) throw new Error('模板包没有有效节点')
+    if (useFlowStore.getState().nodes.length) useFlowStore.getState().addFragment(fragment.nodes, fragment.edges)
+    else useFlowStore.getState().setGraph(fragment.nodes, fragment.edges)
+    setNotice(`已导入模板包「${pkg.title || '未命名'}」：${fragment.nodes.length} 个节点。运行前请检查提示词与连线。`)
   }
 
   const submitExport = async () => {
@@ -318,6 +375,7 @@ export function StudioPanel({ onClose }: { onClose: () => void }) {
           <button className="studio-primary" disabled={Boolean(busy) || running} type="submit">{busy === 'create' ? '创建中…' : '创建并打开'}</button>
           <p className="studio-hint">切换前会同步当前画布；每个作品拥有独立的节点、分镜与时间线。</p>
         </form>
+        <div className="studio-card"><h4>模板包</h4><p className="studio-hint">把当前画布导出为 .huaihua.json 分享给他人；导入的模板包会作为新节点块加入当前画布（节点类型或端口不兼容时会明确报错）。</p><div className="studio-actions"><button disabled={Boolean(busy) || !nodes.length} onClick={() => void operate('export-template', async () => exportTemplatePackage())}>导出当前画布为模板包</button><button disabled={Boolean(busy)} onClick={() => templateFileInput.current?.click()}>导入模板包</button></div></div>
         {!production ? <div className="studio-card"><h4>为当前画布启用制作流程</h4><p className="studio-hint">保留当前节点，把这个画布作为作品继续制作。</p><div className="studio-actions"><button onClick={() => { setProduction(createProduction('product')); setTab('brief') }}>商品宣传片</button><button onClick={() => { setProduction(createProduction('comic')); setTab('brief') }}>漫剧</button></div></div> : null}
         {projects.length ? <div className="studio-list">{projects.map((project) => <article className="studio-card studio-project-card" key={project.id}><div><span className="studio-tag">{project.production?.kind === 'comic' ? '漫剧' : project.production?.kind === 'product' ? '商品宣传片' : '画布'}</span><h4>{project.title}</h4><p>{project.production?.shots.length ?? project.nodes.length} {project.production ? '个镜头' : '个节点'} · {project.updated_at ? new Date(project.updated_at).toLocaleDateString('zh-CN') : '本地作品'}</p></div><div className="studio-actions"><button disabled={Boolean(busy) || running || project.id === projectId} onClick={() => void operate('open', () => openProject(project.id))}>{project.id === projectId ? '当前' : '打开'}</button><button className="studio-danger" disabled={Boolean(busy) || project.id === projectId} onClick={() => setDeleteTarget({ kind: 'project', id: project.id, name: project.title })}>删除</button></div></article>)}</div> : <Empty>暂时没有作品，创建一部新的宣传片或漫剧。</Empty>}
       </> : null}
@@ -356,7 +414,7 @@ export function StudioPanel({ onClose }: { onClose: () => void }) {
         {detachedShots ? <p className="studio-warning">{detachedShots} 个镜头尚未搭建，或内容修改后需要更新节点。重新搭建分镜，或为镜头应用新的本地素材后再运行和导出。</p> : null}
         {production.planning_source ? <p className="studio-source-label">当前分镜来源：{production.planning_source === 'template' ? '本地模板 / 手动编辑' : 'AI 规划 / 手动编辑'}</p> : null}
         <div className="studio-grid-two"><Field label="分集筛选"><select value={episodeId} onChange={(event) => setEpisodeId(event.target.value)}><option value="">全部分集</option>{production.episodes.map((episode) => <option key={episode.id} value={episode.id}>{episode.title}</option>)}</select></Field><Field label="节点规划来源"><select value={source} onChange={(event) => setSource(event.target.value as 'template' | 'ai')}><option value="template">本地模板 / 手动分镜</option><option value="ai">AI 规划</option></select></Field></div>
-        <div className="studio-actions studio-sticky-actions"><button className="studio-primary" disabled={Boolean(busy) || running} onClick={() => void operate('storyboard', makeStoryboard)}>{busy === 'storyboard' ? '搭建中…' : source === 'template' ? '搭建分镜节点' : '请求 AI 规划'}</button><button disabled={Boolean(busy) || running || !filteredShots.length} onClick={() => void runShots(filteredShots)}>{running ? '运行中…' : '运行当前分镜'}</button></div><p className="studio-hint">搭建会追加节点并保留原图。编辑分镜后需重新搭建节点，媒体任务由你手动运行。</p><div className="studio-actions"><button onClick={focusStoryboard} disabled={!nodes.length}>查看分镜画布</button></div>
+        <div className="studio-actions studio-sticky-actions"><button className="studio-primary" disabled={Boolean(busy) || running} onClick={() => void operate('storyboard', makeStoryboard)}>{busy === 'storyboard' ? '搭建中…' : source === 'template' ? '搭建分镜节点' : '请求 AI 规划'}</button><button disabled={Boolean(busy) || running || !filteredShots.length} onClick={() => void runShots(filteredShots, { chainLastFrame })}>{running ? '运行中…' : '运行当前分镜'}</button><label className="studio-check" title="时序接续：上一镜头的尾帧自动作为下一镜头首帧，角色与场景跨镜头连续"><input type="checkbox" checked={chainLastFrame} onChange={(event) => setChainLastFrame(event.target.checked)} /><span>尾帧续拍</span></label></div><p className="studio-hint">搭建会追加节点并保留原图。编辑分镜后需重新搭建节点；勾选「尾帧续拍」后批量运行会按顺序把上一镜头尾帧接给下一镜头。</p><div className="studio-actions"><button onClick={focusStoryboard} disabled={!nodes.length}>查看分镜画布</button></div>
         {filteredShots.map((shot) => {
           const video = mediaForShot(shot, nodes, edges)
           const image = mediaForNode(shot.node_ids?.image_view, 'image', nodes, edges) ?? mediaForNode(shot.node_ids?.image, 'image', nodes, edges)
@@ -410,7 +468,7 @@ export function StudioPanel({ onClose }: { onClose: () => void }) {
 
       {tab === 'settings' ? <>
         <div className="studio-section-title"><h3>本地服务配置</h3><button disabled={Boolean(busy)} onClick={() => void operate('settings', async () => { setSettings(await studioApi.settings()); setNotice('配置状态已刷新') })}>刷新状态</button></div><p className="studio-hint">供应商由你在本机配置。此页面只显示配置状态和模型，不显示或收集密钥。</p>
-        {settings ? <><div className="studio-list">{(['text', 'image', 'video', 'audio'] as const).map((kind) => <article className="studio-provider" key={kind}><div><h4>{kind === 'text' ? '文字 / AI 规划' : `${KIND_LABEL[kind]}生成`}</h4><p>{settings.providers[kind].model || '尚未指定模型'}</p></div><span className={`studio-tag ${settings.providers[kind].configured ? '' : 'warning'}`}>{settings.providers[kind].configured ? '已配置' : '未配置'}</span></article>)}<article className="studio-provider"><div><h4>FFmpeg</h4><p>本地视频拼接、音轨混音与字幕</p></div><span className={`studio-tag ${settings.ffmpeg.available ? '' : 'warning'}`}>{settings.ffmpeg.available ? '可用' : '不可用'}</span></article><article className="studio-provider"><div><h4>自动字幕（本地 Whisper）</h4><p>{settings.subtitles?.model ? `识别模型 ${settings.subtitles.model}` : '语音转写生成字幕'}</p></div><span className={`studio-tag ${settings.subtitles?.available ? '' : 'warning'}`}>{settings.subtitles?.available ? '可用' : '未安装'}</span></article></div><div className="studio-card"><h4>配置文件位置</h4><code className="studio-config-path">{settings.config_path}</code><p className="studio-hint">在本机配置后重新启动服务，再点击刷新。未配置期间仍可编辑项目、使用模板、管理素材与制作本地视频成片。</p></div></> : <Empty>配置状态尚未加载，点击刷新状态重试。</Empty>}
+        {settings ? <><div className="studio-list">{(['text', 'image', 'video', 'audio', 'lipsync'] as const).map((kind) => <article className="studio-provider" key={kind}><div><h4>{kind === 'text' ? '文字 / AI 规划' : kind === 'lipsync' ? '对口型服务（LatentSync 兼容）' : `${KIND_LABEL[kind]}生成`}</h4><p>{settings.providers[kind].model || (kind === 'lipsync' ? '路径交接本地服务' : '尚未指定模型')}</p></div><span className={`studio-tag ${settings.providers[kind].configured ? '' : 'warning'}`}>{settings.providers[kind].configured ? '已配置' : '未配置'}</span></article>)}<article className="studio-provider"><div><h4>FFmpeg</h4><p>本地视频拼接、音轨混音与字幕</p></div><span className={`studio-tag ${settings.ffmpeg.available ? '' : 'warning'}`}>{settings.ffmpeg.available ? '可用' : '不可用'}</span></article><article className="studio-provider"><div><h4>自动字幕（本地 Whisper）</h4><p>{settings.subtitles?.model ? `识别模型 ${settings.subtitles.model}` : '语音转写生成字幕'}</p></div><span className={`studio-tag ${settings.subtitles?.available ? '' : 'warning'}`}>{settings.subtitles?.available ? '可用' : '未安装'}</span></article><article className="studio-provider"><div><h4>BGM 生成（本地 ACE-Step）</h4><p>本地音乐生成，按需下载权重</p></div><span className={`studio-tag ${settings.music?.available ? '' : 'warning'}`}>{settings.music?.available ? '可用' : '未安装'}</span></article></div><div className="studio-card"><h4>配置文件位置</h4><code className="studio-config-path">{settings.config_path}</code><p className="studio-hint">在本机配置后重新启动服务，再点击刷新。未配置期间仍可编辑项目、使用模板、管理素材与制作本地视频成片。</p></div></> : <Empty>配置状态尚未加载，点击刷新状态重试。</Empty>}
       </> : null}
 
       {!production && ['brief', 'cast', 'storyboard', 'timeline'].includes(tab) ? <Empty>先在作品页创建商品宣传片或漫剧，或为当前画布启用制作流程。<button className="studio-primary" onClick={() => setTab('projects')}>打开作品页</button></Empty> : null}
@@ -420,6 +478,12 @@ export function StudioPanel({ onClose }: { onClose: () => void }) {
         setDeleteTarget(null); setNotice('已删除')
       })}>确认删除</button></div></div> : null}
     </div>
+    <input ref={templateFileInput} type="file" accept=".json,application/json" className="studio-hidden-input" aria-label="选择模板包文件" onChange={(event) => {
+      const file = event.target.files?.[0]
+      event.target.value = ''
+      if (!file) return
+      void operate('import-template', async () => importTemplatePackageFile(file))
+    }} />
     <input ref={voiceFileInput} type="file" accept="audio/*" className="studio-hidden-input" aria-label="选择角色参考音频" onChange={(event) => {
       const file = event.target.files?.[0]
       event.target.value = ''

@@ -201,6 +201,21 @@ def delete_asset(asset_id):
     return jsonify(success=True)
 
 
+@studio_bp.route('/api/studio/extract-frame', methods=['POST'])
+@_endpoint
+def extract_frame():
+    """Pull the final frame of a local shot video for sequential chaining."""
+    payload = _payload()
+    service = current_app.extensions.get('generation_service')
+    if service is None:
+        raise StudioValidationError('生成服务尚未初始化，请重启应用')
+    url = payload.get('url')
+    if not isinstance(url, str) or not url:
+        raise StudioValidationError('url 必须是素材地址')
+    frame = service.pipeline.extract_last_frame(url)
+    return jsonify(success=True, frame=frame)
+
+
 @studio_bp.route('/studio-media/<filename>', methods=['GET'])
 def media(filename):
     _, studio = _services()

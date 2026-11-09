@@ -47,6 +47,8 @@ PORT_RULES = {
     'video-gen': ('video', {'in:prompt': (('text',), 2), 'in:first': (('image',), 1), 'in:last': (('image',), 1)}),
     'video-view': ('video', {'in:media': (('video',), 1)}),
     'audio-gen': ('audio', {'in:text': (('text',), 1), 'in:ref': (('audio',), 1)}),
+    'bgm-gen': ('audio', {'in:prompt': (('text',), 1)}),
+    'lipsync': ('video', {'in:video': (('video',), 1), 'in:audio': (('audio',), 1)}),
     'audio-view': ('audio', {'in:media': (('audio',), 1)}),
     'compose': ('video', {'in:video': (('video',), 1), 'in:audio': (('audio',), 2)}),
     'group': ('dynamic', {}),

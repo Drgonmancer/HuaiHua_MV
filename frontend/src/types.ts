@@ -12,6 +12,8 @@ export type NodeKind =
   | 'video-gen'
   | 'video-view'
   | 'audio-gen'
+  | 'bgm-gen'
+  | 'lipsync'
   | 'audio-view'
   | 'compose'
   | 'group'
@@ -59,6 +61,9 @@ export type NodeParams = {
   voiceReferenceText?: string
   speed?: number
   emotion?: string
+  /** BGM 生成参数 */
+  instrumental?: boolean
+  lyrics?: string
 }
 
 export type CanvasNodeData = {

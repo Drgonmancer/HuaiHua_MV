@@ -42,9 +42,10 @@ export type StudioJob = {
   created_at?: string; updated_at?: string
 }
 export type StudioSettings = {
-  providers: Record<'text' | 'image' | 'video' | 'audio', { configured: boolean; model: string }>
+  providers: Record<'text' | 'image' | 'video' | 'audio' | 'lipsync', { configured: boolean; model: string }>
   ffmpeg: { available: boolean }
   subtitles?: { available: boolean; model: string }
+  music?: { available: boolean; model: string }
   audio?: { protocol?: string; cloning?: boolean }
   config_path: string
 }

@@ -15,6 +15,8 @@ export const NODE_TYPE_META: Record<
   'video-gen': { icon: '🎬', label: '视频生成', accent: '#7c5cff' },
   'video-view': { icon: '▶', label: '视频视图', accent: '#60a5fa' },
   'audio-gen': { icon: '🎙', label: '音频生成', accent: '#7c5cff' },
+  'bgm-gen': { icon: '♫', label: 'BGM 生成', accent: '#7c5cff' },
+  lipsync: { icon: '🗣', label: '对口型', accent: '#7c5cff' },
   'audio-view': { icon: '🎵', label: '音频视图', accent: '#60a5fa' },
   compose: { icon: '⧉', label: '合成', accent: '#f472b6' },
   group: { icon: '▣', label: '分组', accent: '#9aa0aa' },

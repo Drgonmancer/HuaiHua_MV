@@ -12,7 +12,7 @@ before(async () => {
   const root = fileURLToPath(new URL('../', import.meta.url))
   const built = await build({
     stdin: {
-      contents: 'export * from "./src/engine/executor.ts"; export * from "./src/engine/fingerprint.ts"; export {useFlowStore,createNode} from "./src/store/flowStore.ts";',
+      contents: 'export * from "./src/engine/executor.ts"; export * from "./src/engine/fingerprint.ts"; export * from "./src/nodes/portRules.ts"; export * from "./src/ui/studio/productionLogic.ts"; export {useFlowStore,createNode} from "./src/store/flowStore.ts";',
       resolveDir: root,
       loader: 'ts',
     },
@@ -202,4 +202,45 @@ test('changed prompt inputs submit a new provider request', async () => {
     assert.equal(await engine.executeNode(image.id), true)
     assert.equal(posts, 1, '提示词变化后应发起新请求')
   } finally { globalThis.fetch = originalFetch }
+})
+
+test('template package round-trip rebuilds a renamed fragment', () => {
+  const prompt = engine.createNode('prompt', {x: 0, y: 0}, {value: {text: '模板提示词'}})
+  const bgm = engine.createNode('bgm-gen', {x: 300, y: 0})
+  flow.getState().setGraph([prompt, bgm], [{id: 't-edge', source: prompt.id, target: bgm.id, targetHandle: 'in:prompt', data: {order: 1, mediaType: 'text'}}])
+  bgm.data.runtime = {status: 'succeeded', jobIds: ['done-1']}
+  const pkg = engine.buildTemplatePackage('测试模板', flow.getState().nodes, flow.getState().edges, {x: 0, y: 0, zoom: 1})
+  assert.equal(pkg.format, 'huaihua-template')
+  assert.equal(pkg.nodes.find(n => n.type === 'bgm-gen').data.runtime.status, 'idle', '导出时运行时状态应清零')
+  const existing = [engine.createNode('prompt', {x: 0, y: 0}, {value: {text: '已有节点'}})]
+  const existingIds = new Set(existing.map(n => n.id))
+  const pkgSnapshot = JSON.parse(JSON.stringify(pkg))
+  const fragment = engine.prepareStoryboardFragment(
+    {title: pkgSnapshot.title, nodes: pkgSnapshot.nodes, edges: pkgSnapshot.edges, production: undefined}, existing)
+  assert.equal(fragment.nodes.length, 2)
+  for (const node of fragment.nodes) {
+    assert.ok(!existingIds.has(node.id), '导入节点 id 不得与现有节点冲突')
+    assert.equal(node.data.runtime.status, 'idle')
+  }
+  assert.equal(fragment.edges.length, 1)
+  const importedIds = new Set(fragment.nodes.map(n => n.id))
+  assert.ok(importedIds.has(fragment.edges[0].source) && importedIds.has(fragment.edges[0].target), '连线端点必须都存在')
+})
+
+test('parsed template packages reject foreign formats and unknown node types', () => {
+  assert.throws(() => engine.parseTemplatePackage(JSON.stringify({format: 'other', version: 1, nodes: []})), /槐花MV/)
+  assert.throws(() => engine.parseTemplatePackage(JSON.stringify({format: 'huaihua-template', version: 1, title: 'x', nodes: [{id: 'a', type: 'mystery-node'}], edges: []})), /未知节点类型/)
+  assert.throws(() => engine.parseTemplatePackage('not-json'), /JSON/)
+})
+
+test('bgm and lipsync nodes follow port rules', () => {
+  const prompt = engine.createNode('prompt', {x: 0, y: 0}, {value: {text: '轻快电商节奏'}})
+  const bgm = engine.createNode('bgm-gen', {x: 300, y: 0})
+  const view = engine.createNode('audio-view', {x: 600, y: 0})
+  assert.equal(engine.checkConnection(prompt, bgm, 'in:prompt', []).ok, true)
+  assert.equal(engine.checkConnection(bgm, view, 'in:media', []).ok, true)
+  const video = engine.createNode('video-view', {x: 0, y: 300})
+  const lip = engine.createNode('lipsync', {x: 300, y: 300})
+  assert.equal(engine.checkConnection(video, lip, 'in:video', []).ok, true)
+  assert.equal(engine.checkConnection(bgm, lip, 'in:audio', []).ok, true)
 })

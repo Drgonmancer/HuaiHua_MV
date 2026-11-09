@@ -32,6 +32,8 @@ export const studioApi = {
     return payload as { asset: StudioAsset }
   },
   deleteAsset: (id: string) => api(`/api/studio/assets/${encode(id)}`, { method: 'DELETE' }),
+  extractFrame: (url: string) =>
+    api<{ frame: { kind: 'image'; url: string } }>('/api/studio/extract-frame', json({ url })),
   jobs: (projectId?: string | null, signal?: AbortSignal) =>
     api<{ jobs: StudioJob[] }>(`/api/studio/jobs${projectId ? `?project_id=${encode(projectId)}` : ''}`, { signal }),
   retryJob: (id: string) => api<{ job: StudioJob }>(`/api/studio/jobs/${encode(id)}/retry`, json({})),

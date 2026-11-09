@@ -13,13 +13,15 @@ import { nodeFingerprint } from './fingerprint'
 import type { CanvasNode, NodeOutput, NodeKind } from '../types'
 import { useProjectStore } from '../store/projectStore'
 
-type JobKindName = 'image' | 'video' | 'audio' | 'compose'
+type JobKindName = 'image' | 'video' | 'audio' | 'music' | 'lipsync' | 'compose'
 
 const JOB_KIND: Partial<Record<NodeKind, JobKindName>> = {
   'image-gen': 'image',
   'image-edit': 'image',
   'video-gen': 'video',
   'audio-gen': 'audio',
+  'bgm-gen': 'music',
+  lipsync: 'lipsync',
   compose: 'compose',
 }
 
@@ -28,20 +30,24 @@ const VIEW_TYPE: Partial<Record<NodeKind, NodeKind>> = {
   'image-edit': 'image-view',
   'video-gen': 'video-view',
   'audio-gen': 'audio-view',
+  'bgm-gen': 'audio-view',
+  lipsync: 'video-view',
   compose: 'video-view',
 }
 
-const POLL_INTERVAL_MS = { image: 2000, video: 5000, audio: 3000, compose: 3000 } as const
+const POLL_INTERVAL_MS = { image: 2000, video: 5000, audio: 3000, music: 5000, lipsync: 5000, compose: 3000 } as const
 const MAX_POLL_INTERVAL_MS = 15000
-const CONCURRENCY = { image: 2, video: 1, audio: 1, compose: 1 } as const
+const CONCURRENCY = { image: 2, video: 1, audio: 1, music: 1, lipsync: 1, compose: 1 } as const
 
 type RunJob = { kind: string; id: string }
 
-const active = { image: 0, video: 0, audio: 0, compose: 0 }
+const active = { image: 0, video: 0, audio: 0, music: 0, lipsync: 0, compose: 0 }
 const waiters: Record<JobKindName, (() => void)[]> = {
   image: [],
   video: [],
   audio: [],
+  music: [],
+  lipsync: [],
   compose: [],
 }
 const pollingNodes = new Set<string>()

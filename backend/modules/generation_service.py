@@ -16,6 +16,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import ssl
@@ -32,6 +33,7 @@ import requests
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from modules.media_pipeline import MediaError, MediaPipeline, number
+from modules.music_service import MusicService
 from modules.speech_service import SpeechService
 from modules.studio_service import StudioService, StudioValidationError, normalize_production
 
@@ -199,7 +201,9 @@ class PublicMediaDownloader:
 
 
 class GenerationService:
-    KINDS = {'image-gen': 'image', 'image-edit': 'image', 'video-gen': 'video', 'audio-gen': 'audio', 'compose': 'compose'}
+    KINDS = {'image-gen': 'image', 'image-edit': 'image', 'video-gen': 'video', 'audio-gen': 'audio',
+             'bgm-gen': 'music', 'lipsync': 'lipsync', 'compose': 'compose'}
+    CACHEABLE_KINDS = ('image', 'video', 'audio', 'music', 'lipsync', 'compose')
 
     def __init__(self, db_path, settings=None):
         self.db_path = Path(db_path).resolve()
@@ -209,8 +213,9 @@ class GenerationService:
         self.settings = dict(os.environ if settings is None else settings)
         self.speech = SpeechService(self.db_path.parent / 'models' / 'whisper', settings=self.settings)
         self.pipeline = MediaPipeline(self.media_dir, transcriber=self.speech.transcribe)
+        self.music = MusicService(self.media_dir, self.db_path.parent / 'models' / 'ace-step', settings=self.settings)
         self.downloader = PublicMediaDownloader(self.media_dir)
-        self.providers = {kind: self._provider(kind) for kind in ('text', 'image', 'video', 'audio')}
+        self.providers = {kind: self._provider(kind) for kind in ('text', 'image', 'video', 'audio', 'lipsync')}
         self._lock = threading.RLock()
         self._cancel = {}
         self._futures = {}
@@ -254,7 +259,11 @@ class GenerationService:
         base = read('BASE_URL')
         key, model = read('API_KEY'), read('MODEL')
         protocol = read('PROTOCOL') or ('seedance' if kind == 'video' else 'openai')
-        configured = bool(base and key and model)
+        if kind == 'lipsync':
+            # Local lipsync service: base URL only; no key/model in the contract.
+            configured = bool(base)
+        else:
+            configured = bool(base and key and model)
         if configured:
             parsed = urlsplit(base)
             # Provider URLs are explicitly configured by the local user, so
@@ -270,7 +279,10 @@ class GenerationService:
 
     def require_provider(self, kind):
         if not self.providers[kind]['configured']:
-            label = {'text': '文字规划', 'image': '图片生成', 'video': '视频生成', 'audio': '语音生成'}[kind]
+            label = {'text': '文字规划', 'image': '图片生成', 'video': '视频生成', 'audio': '语音生成',
+                     'lipsync': '对口型服务'}[kind]
+            if kind == 'lipsync':
+                raise GenerationError(f'尚未配置{label}，请在本地 .env 中设置 LIPSYNC_BASE_URL 后重启', 503)
             raise GenerationError(f'尚未配置{label}供应商，请在本地 .env 中设置 {kind.upper()}_BASE_URL、{kind.upper()}_API_KEY 和 {kind.upper()}_MODEL 后重启', 503)
         return self.providers[kind]
 
@@ -300,7 +312,7 @@ class GenerationService:
                          'models': provider['models'] if provider['configured'] else []}
                   for kind, provider in self.providers.items()}
         return {'providers': public, 'ffmpeg': {'available': self.pipeline.available},
-                'subtitles': self.speech.status(),
+                'subtitles': self.speech.status(), 'music': self.music.status(),
                 'config_path': str(Path(__file__).resolve().parents[2] / '.env'),
                 'image_models': self.image_models(), 'video_models': self.video_models(), 'audio': self.audio_meta()}
 
@@ -357,13 +369,14 @@ class GenerationService:
                 raise GenerationError('尚未配置生成供应商，请先在本地 .env 中配置', 503)
             raise GenerationError('node_type 必须是 image-gen、image-edit、video-gen、audio-gen 或 compose')
         kind = self.KINDS[node_type]
-        if kind != 'compose':
+        if kind not in ('compose', 'music'):
             self.require_provider(kind)
         params, inputs = payload.get('params', {}), payload.get('inputs', {})
         if not isinstance(params, dict) or not isinstance(inputs, dict):
             raise GenerationError('params 和 inputs 必须是对象')
         allowed = {'image-gen': {'prompt': 4, 'ref': 6}, 'image-edit': {'image': 1, 'prompt': 1, 'ref': 4},
                    'video-gen': {'prompt': 2, 'first': 1, 'last': 1}, 'audio-gen': {'text': 1, 'ref': 1},
+                   'bgm-gen': {'prompt': 1}, 'lipsync': {'video': 1, 'audio': 1},
                    'compose': {'video': 1, 'audio': 2}}[node_type]
         for name, values in inputs.items():
             if name not in allowed or not isinstance(values, list) or len(values) > allowed[name]:
@@ -375,7 +388,26 @@ class GenerationService:
                 if name in ('ref', 'first', 'last', 'image') and kind != 'audio':
                     self._image_data(value)
         params = dict(params)
-        if kind != 'compose':
+        if node_type == 'bgm-gen':
+            if not self.music.available:
+                raise GenerationError('BGM 生成需要本机安装 ACE-Step：git clone https://github.com/ace-step/ACE-Step '
+                                      '后 pip install -e ./ACE-Step（装入当前 .venv），安装后重启应用', 400)
+            if not inputs.get('prompt'):
+                raise GenerationError('请连接文本输入作为音乐风格描述')
+            _text('\n'.join(inputs['prompt']), 'prompt', 2000)
+            duration = number(params.get('durationSeconds', 30), 'BGM时长', 5, 240)
+            if int(duration) != duration:
+                raise GenerationError('BGM 时长必须是整数秒')
+            params['durationSeconds'] = int(duration)
+            instrumental = params.get('instrumental', True)
+            if not isinstance(instrumental, bool):
+                raise GenerationError('instrumental 必须是布尔值')
+            params['instrumental'] = instrumental
+            params['lyrics'] = _text(params.get('lyrics') or '', '歌词', 5000, True)
+        elif node_type == 'lipsync':
+            if not inputs.get('video') or not inputs.get('audio'):
+                raise GenerationError('对口型节点需要同时连接视频与人声输入')
+        elif kind not in ('compose', 'lipsync'):
             params['model'] = self._selected_model(kind, params)
             text_key = 'text' if kind == 'audio' else 'prompt'
             if not inputs.get(text_key):
@@ -476,7 +508,7 @@ class GenerationService:
 
         Returns the new completed job or None. The caller holds self._lock.
         """
-        if original.get('force') or kind not in ('image', 'video', 'audio', 'compose'):
+        if original.get('force') or kind not in self.CACHEABLE_KINDS:
             return None
         content_hash = self._content_hash(payload)
         with self._connection() as connection:
@@ -539,6 +571,15 @@ class GenerationService:
                 outputs = self._audio(payload, cancel)
             elif kind == 'video':
                 outputs = self._video(job_id, payload, cancel)
+            elif kind == 'music':
+                outputs = [self.music.generate(
+                    tags='\n'.join(payload['inputs']['prompt']),
+                    lyrics=payload['params'].get('lyrics', ''),
+                    duration=payload['params'].get('durationSeconds', 30),
+                    instrumental=payload['params'].get('instrumental', True),
+                    cancel=cancel)]
+            elif kind == 'lipsync':
+                outputs = [self._lipsync(payload, cancel)]
             else:
                 export = payload if kind == 'export' else {
                     'clips': [{'url': url, 'subtitle': payload['params'].get('subtitle', '')} for url in payload['inputs']['video']],
@@ -758,6 +799,55 @@ class GenerationService:
             raise GenerationError('任务已取消', 409)
         return [self._save(data, 'audio', content_type)]
 
+    def _lipsync(self, payload, cancel):
+        """Drive the configured local lipsync service (LatentSync-compatible contract).
+
+        POST {LIPSYNC_BASE_URL}/generate {video_path, audio_path} -> {job_id};
+        GET  {LIPSYNC_BASE_URL}/status/{job_id} -> {status, video_path}.
+        The service reads the shared media directory directly; LIPSYNC_MEDIA_ROOT
+        remaps the path when it mounts the library somewhere else. Path-based
+        handover keeps every request local — no result download URL surface.
+        """
+        video_path = self.pipeline.resolve_media(payload['inputs']['video'][0])
+        audio_path = self.pipeline.resolve_media(payload['inputs']['audio'][0])
+        root = str(self.settings.get('LIPSYNC_MEDIA_ROOT') or '').strip()
+        if root:
+            remap_root = Path(root).resolve()
+            video_path = remap_root / video_path.relative_to(self.media_dir)
+            audio_path = remap_root / audio_path.relative_to(self.media_dir)
+        if cancel.is_set():
+            raise GenerationError('任务已取消', 409)
+        result = self._request_json('lipsync', '/generate',
+                                    payload={'video_path': str(video_path), 'audio_path': str(audio_path)})
+        job_id = result.get('job_id') or result.get('id')
+        if not isinstance(job_id, str) or not re.fullmatch(r'[\w.-]{1,200}', job_id):
+            raise GenerationError('对口型服务没有返回有效任务 ID', 502)
+        interval = number(self.settings.get('LIPSYNC_POLL_INTERVAL') or 3, 'LIPSYNC_POLL_INTERVAL', .01, 60)
+        started = time.monotonic()
+        while True:
+            if cancel.is_set():
+                raise GenerationError('任务已取消', 409)
+            status = self._request_json('lipsync', '/status/' + quote(job_id, safe=''), method='GET')
+            state = status.get('status')
+            if state in ('succeeded', 'completed'):
+                source = status.get('video_path')
+                if not isinstance(source, str) or not source:
+                    raise GenerationError('对口型服务结果缺少视频路径', 502)
+                path = Path(source)
+                if path.suffix.lower() not in ('.mp4', '.mov', '.webm') or not path.is_file() or path.stat().st_size == 0:
+                    raise GenerationError('对口型服务产出的视频无效', 502)
+                if path.stat().st_size > 100 * 1024 * 1024:
+                    raise GenerationError('对口型服务产出的视频超过大小限制', 502)
+                filename = uuid.uuid4().hex + path.suffix.lower()
+                shutil.copyfile(path, self.media_dir / filename)
+                return {'kind': 'video', 'url': '/studio-media/' + filename}
+            if state in ('failed', 'canceled', 'cancelled', 'expired'):
+                raise GenerationError('对口型服务任务失败，请检查服务日志', 502)
+            if time.monotonic() - started > 1800:
+                raise GenerationError('对口型等待超过 30 分钟，请检查服务状态后重试', 504)
+            if cancel.wait(interval):
+                raise GenerationError('任务已取消', 409)
+
     def _video(self, job_id, payload, cancel):
         params, inputs = payload['params'], payload['inputs']
         provider = self.providers['video']
@@ -872,13 +962,14 @@ class GenerationService:
         brief = _text(brief, 'brief', 20000)
         context = normalize_production(production) if production is not None else None
         system = ('你是画布工作流规划器。返回 JSON {title,nodes,edges}。nodes 形如 {id,type,title,text?,params?,x,y}，'
-                  '只允许 prompt,image-gen,image-edit,image-view,video-gen,video-view,audio-gen,audio-view,compose。'
+                  '只允许 prompt,image-gen,image-edit,image-view,video-gen,video-view,audio-gen,bgm-gen,lipsync,audio-view,compose。'
                   'edges 形如 {source,target,targetHandle,data:{order,mediaType}}。所有 ID 必须存在，不可循环，必须匹配端口。'
                   'prompt 输出 text；image-gen 的 in:prompt 接 text，in:ref 接 image；'
                   'image-edit 的 in:image 接待编辑图片，in:prompt 接编辑指令，in:ref 接角色参考图；image-view 的 in:media 接 image；'
                   'video-gen 的 in:prompt 接 text，in:first/in:last 接 image；video-view 的 in:media 接 video；'
-                  'audio-gen 的 in:text 接 text，可选 in:ref 接参考音频（声音克隆）；audio-view 的 in:media 接 audio；'
-                  'compose 的 in:video 接 video，in:audio 接 audio。')
+                  'audio-gen 的 in:text 接 text，可选 in:ref 接参考音频（声音克隆）；'
+                  'bgm-gen 的 in:prompt 接音乐风格描述，输出 audio；lipsync 的 in:video 接视频、in:audio 接人声，输出对口型视频；'
+                  'audio-view 的 in:media 接 audio；compose 的 in:video 接 video，in:audio 接 audio。')
         result = self._completion(system, _json({'brief': brief, 'production': context}), True)
         try:
             title = _text(result.get('title'), 'plan.title', 200)
