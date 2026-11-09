@@ -153,4 +153,4 @@ React 19 · TypeScript · React Flow · Zustand · Vite · Flask · SQLite · FF
 
 ## 许可证
 
-项目许可证尚未确认，后续核对原始代码与依赖的许可后补充 `LICENSE`；当前未声明 MIT、Apache 或其他开源许可。
+本项目以 [MIT 许可证](LICENSE) 开源。第三方依赖与模型权重各自遵循其原始许可，使用前请自行核对。
